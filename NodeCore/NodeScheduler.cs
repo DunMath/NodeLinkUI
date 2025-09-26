@@ -22,7 +22,7 @@ namespace NodeCore.Scheduling
 
         public NodeScheduler(List<AgentStatus> agents)
         {
-            this.agents = agents;
+            this.agents = agents ?? new List<AgentStatus>();
         }
 
         public void SetMode(SchedulerMode newMode)
@@ -32,6 +32,11 @@ namespace NodeCore.Scheduling
 
         public string SelectAgent(string taskType, string manualChoice = "")
         {
+            if (agents == null || !agents.Any())
+            {
+                return "None";
+            }
+
             switch (mode)
             {
                 case SchedulerMode.Manual:
@@ -67,8 +72,15 @@ namespace NodeCore.Scheduling
 
         private bool MatchesAffinity(AgentStatus agent, string taskType)
         {
-            // Stub: match based on taskType and agent capabilities
-            return true;
+            if (taskType.StartsWith("Launch:"))
+            {
+                return agent.HasFileAccess;
+            }
+            if (taskType.StartsWith("add:"))
+            {
+                return true;
+            }
+            return agent.HasGpu && agent.HasCuda;
         }
 
         private int ScoreAgent(AgentStatus status)
@@ -78,7 +90,7 @@ namespace NodeCore.Scheduling
             score += (int)(100 - status.GpuUsagePercent);
             score += (int)(status.MemoryAvailableMB / 100);
             score -= status.TaskQueueLength * 10;
-            return score;
+            return Math.Max(0, score); // Prevent negative scores
         }
     }
 }

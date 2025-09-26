@@ -10,4 +10,8 @@
     <PackageReference Include="System.Management" Version="9.0.9" />
   </ItemGroup>
 
+	<ItemGroup>
+		<PackageReference Include="Makaretu.Dns" Version="*" />
+	</ItemGroup>
+
 </Project>

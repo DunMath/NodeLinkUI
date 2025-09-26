@@ -9,10 +9,11 @@
   <ItemGroup>
     <PackageReference Include="System.Management" Version="9.0.9" />
   </ItemGroup>
-
+ 
   <ItemGroup>
     <ProjectReference Include="..\NodeAgent\NodeAgent.csproj" />
     <ProjectReference Include="..\NodeComm\NodeComm.csproj" />
+	<ProjectReference Include="..\NodeCore\NodeCore.csproj" />
   </ItemGroup>
 
 </Project>

@@ -9,6 +9,7 @@ namespace NodeCore
         public string AgentId { get; set; } = "";
         public DateTime LastHeartbeat { get; set; }
         public bool IsOnline { get; set; }
+        public string IpAddress { get; set; } = ""; // Added for NodeGrid
 
         public float CpuUsagePercent { get; set; }
         public float GpuUsagePercent { get; set; }
@@ -28,10 +29,10 @@ namespace NodeCore
         public bool IsBusy => TaskQueueLength > 0 || CpuUsagePercent > 85 || GpuUsagePercent > 85;
 
         // 🧩 GPU capability reporting (plug-and-play + future CUDA support)
-        public bool HasGpu { get; set; }               // True if any GPU is detected
-        public bool HasCuda { get; set; }              // Reserved for future CUDA detection
-        public string GpuModel { get; set; } = "";     // GPU name/model
-        public int GpuMemoryMB { get; set; }           // Approximate VRAM in MB
+        public bool HasGpu { get; set; }
+        public bool HasCuda { get; set; }
+        public string GpuModel { get; set; } = "";
+        public int GpuMemoryMB { get; set; }
 
         // ✅ Serialize to JSON
         public string ToJson()
