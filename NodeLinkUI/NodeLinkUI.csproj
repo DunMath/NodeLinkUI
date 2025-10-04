@@ -9,6 +9,8 @@
 	</PropertyGroup>
 
 	<ItemGroup>
+		<PackageReference Include="Makaretu.Dns" Version="2.0.1" />
+		<PackageReference Include="Makaretu.Dns.Multicast" Version="0.27.0" />
 		<PackageReference Include="System.Diagnostics.PerformanceCounter" Version="9.0.9" />
 		<PackageReference Include="System.Management" Version="9.0.9" />
 		<PackageReference Include="Zeroconf" Version="3.6.11" />
@@ -19,10 +21,6 @@
 		<ProjectReference Include="..\NodeComm\NodeComm.csproj" />
 		<ProjectReference Include="..\NodeCore\NodeCore.csproj" />
 		<ProjectReference Include="..\NodeMaster\NodeMaster.csproj" />
-	
-	</ItemGroup>
-
-	<ItemGroup>
 	
 	</ItemGroup>
 

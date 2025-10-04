@@ -1,34 +1,79 @@
 ﻿<Window x:Class="NodeLinkUI.SettingsWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:local="clr-namespace:NodeLinkUI"
-        Title="Settings" Height="450" Width="600">
-    <Window.Resources>
-        <local:BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter"/>
-    </Window.Resources>
+        Title="Settings" Height="700" Width="1000">
     <Grid Margin="10">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
+            <!-- Master IP -->
             <RowDefinition Height="Auto"/>
+            <!-- Heartbeat -->
             <RowDefinition Height="Auto"/>
+            <!-- Use GPU -->
+            <RowDefinition Height="Auto"/>
+            <!-- Security -->
             <RowDefinition Height="*"/>
+            <!-- Nominated Apps -->
             <RowDefinition Height="Auto"/>
+            <!-- Buttons -->
         </Grid.RowDefinitions>
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="*"/>
         </Grid.ColumnDefinitions>
 
-        <Label Grid.Row="0" Grid.Column="0" Content="Master IP:"/>
-        <TextBox Grid.Row="0" Grid.Column="1" x:Name="MasterIpTextBox" Margin="5"/>
+        <!-- Master IP -->
+        <Label Grid.Row="0" Grid.Column="0" Content="Master IP:" VerticalAlignment="Center"/>
+        <TextBox Grid.Row="0" Grid.Column="1" x:Name="MasterIpTextBox" Margin="5"
+                 Text="{Binding MasterIp, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
 
-        <Label Grid.Row="1" Grid.Column="0" Content="Heartbeat Interval (ms):"/>
-        <TextBox Grid.Row="1" Grid.Column="1" x:Name="HeartbeatIntervalTextBox" Margin="5"/>
+        <!-- Heartbeat -->
+        <Label Grid.Row="1" Grid.Column="0" Content="Heartbeat Interval (ms):" VerticalAlignment="Center"/>
+        <TextBox Grid.Row="1" Grid.Column="1" x:Name="HeartbeatIntervalTextBox" Margin="5"
+                 Text="{Binding HeartbeatIntervalMs, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
 
-        <CheckBox Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" x:Name="UseGpuCheckBox" Content="Use GPU Globally" Margin="5"/>
+        <!-- Use GPU -->
+        <CheckBox Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2"
+                  x:Name="UseGpuCheckBox" Content="Use GPU Globally" Margin="5"
+                  IsChecked="{Binding UseGpuGlobally, Mode=TwoWay}"/>
 
-        <GroupBox Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2" Header="Nominated Apps" Margin="5">
-            <Grid>
+        <!-- Security -->
+        <GroupBox Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2" Header="Security (Join Code)">
+            <Grid Margin="8">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <Label Grid.Row="0" Grid.Column="0" Content="Join Code:" VerticalAlignment="Center"/>
+
+                <!-- Secret/Plain toggle: we keep both and switch visibility in code-behind -->
+                <PasswordBox Grid.Row="0" Grid.Column="1" x:Name="JoinCodeSecret" Margin="5" PasswordChar="●"/>
+                <TextBox     Grid.Row="0" Grid.Column="1" x:Name="JoinCodePlain"  Margin="5" Visibility="Collapsed"/>
+
+                <CheckBox Grid.Row="0" Grid.Column="2" x:Name="ShowCodeCheckBox" Content="Show" Margin="6,5,0,5"
+                          Checked="ShowCodeCheckBox_Checked" Unchecked="ShowCodeCheckBox_Unchecked"/>
+
+                <CheckBox Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,6,0,0"
+                          Content="Require Join Code (reject unauthenticated nodes)"
+                          IsChecked="{Binding ProhibitUnauthenticated, Mode=TwoWay}"/>
+
+                <StackPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,6,0,0">
+                    <Button Content="Generate" Width="100" Margin="0,0,6,0" Click="GenerateJoinCodeButton_Click"/>
+                    <Button Content="Copy"     Width="80"  Margin="0,0,6,0" Click="CopyJoinCodeButton_Click"/>
+                </StackPanel>
+            </Grid>
+        </GroupBox>
+
+        <!-- Nominated Apps -->
+        <GroupBox Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="2" Header="Nominated Apps" Margin="0,6,0,0">
+            <Grid Margin="8">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="*"/>
                     <RowDefinition Height="Auto"/>
@@ -36,25 +81,37 @@
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
-                <ListBox x:Name="SelectedAppsListBox" Grid.Row="0" Margin="5" SelectionChanged="SelectedAppsListBox_SelectionChanged"/>
-                <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+
+                <ListBox x:Name="SelectedAppsListBox" Grid.Row="0" Grid.ColumnSpan="2" Margin="0,0,0,8"
+                         Height="140" ScrollViewer.VerticalScrollBarVisibility="Auto"
+                         SelectionChanged="SelectedAppsListBox_SelectionChanged" DisplayMemberPath="Name"/>
+
+                <StackPanel Grid.Row="1" Grid.ColumnSpan="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,0,0,8">
                     <Button x:Name="AddAppButton" Content="Add App" Margin="5" Click="AddAppButton_Click"/>
                     <Button x:Name="RemoveAppButton" Content="Remove App" Margin="5" Click="RemoveAppButton_Click"/>
                 </StackPanel>
-                <Label Grid.Row="2" Content="App Name:"/>
+
+                <Label Grid.Row="2" Grid.Column="0" Content="App Name:" VerticalAlignment="Center"/>
                 <TextBox Grid.Row="2" Grid.Column="1" x:Name="AppNameTextBox" Margin="5" IsReadOnly="True"/>
-                <Label Grid.Row="3" Content="App Path:"/>
+
+                <Label Grid.Row="3" Grid.Column="0" Content="App Path:" VerticalAlignment="Center"/>
                 <TextBox Grid.Row="3" Grid.Column="1" x:Name="AppPathTextBox" Margin="5" IsReadOnly="True"/>
-                <Label Grid.Row="4" Content="Preferred Agent:" Visibility="{Binding IsProVersion, Converter={StaticResource BooleanToVisibilityConverter}}"/>
-                <ComboBox Grid.Row="4" Grid.Column="1" x:Name="PreferredAgentComboBox" Margin="5" Visibility="{Binding IsProVersion, Converter={StaticResource BooleanToVisibilityConverter}}"/>
             </Grid>
         </GroupBox>
 
-        <StackPanel Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" HorizontalAlignment="Right">
-            <Button x:Name="SaveButton" Content="Save" Margin="5" Click="SaveButton_Click"/>
+        <!-- Buttons -->
+        <StackPanel Grid.Row="5" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button x:Name="SaveButton"   Content="Save"   Margin="5" Click="SaveButton_Click"/>
             <Button x:Name="CancelButton" Content="Cancel" Margin="5" Click="CancelButton_Click"/>
         </StackPanel>
     </Grid>
 </Window>
+
+
+
 
 

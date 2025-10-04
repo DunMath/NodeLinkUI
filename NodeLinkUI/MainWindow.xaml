@@ -1,93 +1,274 @@
 ﻿<Window x:Class="NodeLinkUI.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:local="clr-namespace:NodeLinkUI"
         xmlns:core="clr-namespace:NodeCore;assembly=NodeCore"
-        Title="NodeLink Control Panel" Height="600" Width="800">
+        Title="NodeLink Control Panel" Height="720" Width="1180">
     <Window.Resources>
-        <local:BooleanToStringConverter x:Key="BooleanToStringConverter" />
+        <!-- Keep styles light so system theme applies -->
+        <Style TargetType="GroupBox">
+            <Setter Property="Margin" Value="0,6,0,0"/>
+            <Setter Property="Padding" Value="8"/>
+        </Style>
+        <Style TargetType="TextBlock">
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+        <Style TargetType="Button">
+            <Setter Property="Margin" Value="6,0,0,0"/>
+            <Setter Property="Padding" Value="10,6"/>
+        </Style>
+        <Style TargetType="ComboBox">
+            <Setter Property="Margin" Value="6,0,0,0"/>
+            <Setter Property="Padding" Value="6,3"/>
+            <Setter Property="MinWidth" Value="140"/>
+        </Style>
+        <Style TargetType="TextBox">
+            <Setter Property="Margin" Value="6,0,0,0"/>
+            <Setter Property="Padding" Value="8,6"/>
+            <Setter Property="MinWidth" Value="220"/>
+        </Style>
+        <Style TargetType="DataGrid">
+            <Setter Property="AlternationCount" Value="2"/>
+            <Setter Property="RowHeaderWidth" Value="0"/>
+        </Style>
     </Window.Resources>
-    <Grid Margin="10">
+
+    <Grid Margin="12">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
+            <!-- Row 0: Header -->
             <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
+            <!-- Row 1: Controls -->
+            <RowDefinition Height="3*"/>
+            <!-- Row 2: Nodes (full width, tall) -->
+            <RowDefinition Height="1.2*"/>
+            <!-- Row 3: Alerts (Tasks hidden) -->
+            <RowDefinition Height="1.3*"/>
+            <!-- Row 4: Log -->
         </Grid.RowDefinitions>
 
-        <!-- Row 0: Role and status -->
-        <StackPanel Orientation="Horizontal" Grid.Row="0" Margin="0,0,0,10">
-            <TextBlock Text="Current Role:" Margin="0,0,10,0"/>
-            <TextBlock x:Name="RoleLabel" FontWeight="Bold" Margin="0,0,20,0"/>
-            <Button x:Name="SwitchRoleButton" Content="Switch Role" Click="SwitchRole_Click" Margin="0,0,20,0"/>
-            <TextBlock Text="Master Status:" Margin="0,0,10,0"/>
-            <TextBlock x:Name="MasterStatusLabel" FontWeight="Bold" Margin="0,0,20,0"/>
-            <TextBlock Text="Uptime:" Margin="0,0,10,0"/>
-            <TextBlock x:Name="MasterUptimeLabel" FontWeight="Bold"/>
-        </StackPanel>
-
-        <!-- Row 1: Controls -->
-        <WrapPanel Grid.Row="1" Margin="0,0,0,10">
-            <Button x:Name="RegisterAgentButton" Content="Register Agent" Width="100" Margin="0,0,10,5" Click="RegisterAgent_Click"/>
-            <Button x:Name="DispatchTaskButton" Content="Dispatch Task" Width="100" Margin="0,0,10,5" Click="DispatchTask_Click"/>
-            <Button x:Name="BroadcastButton" Content="Broadcast" Width="100" Margin="0,0,10,5" Click="Broadcast_Click"/>
-            <TextBox x:Name="TaskInputBox" Width="120" Margin="0,0,10,5" VerticalAlignment="Center"/>
-            <Button x:Name="CustomTaskButton" Content="Send Custom Task" Width="120" Margin="0,0,10,5" Click="CustomTaskButton_Click"/>
-            <Button x:Name="StopAllTasksButton" Content="Stop All Tasks" Width="100" Margin="0,0,10,5" Click="StopAllTasksButton_Click"/>
-            <TextBlock Text="Scheduler Mode:" Margin="10,0,5,5" VerticalAlignment="Center"/>
-            <ComboBox x:Name="SchedulerModeDropdown" Width="120" Margin="0,0,10,5" SelectionChanged="SchedulerModeDropdown_Changed">
-                <ComboBoxItem Content="Auto" IsSelected="True"/>
-                <ComboBoxItem Content="Manual"/>
-                <ComboBoxItem Content="Affinity"/>
-                <ComboBoxItem Content="RoundRobin"/>
-                <ComboBoxItem Content="LeastBusy"/>
-            </ComboBox>
-            <Button x:Name="SettingsButton" Content="Settings" Width="80" Margin="0,0,10,5" Click="SettingsButton_Click"/>
-            <Button x:Name="ExitButton" Content="Save+Exit" Width="80" Margin="0,0,10,5" Click="ExitButton_Click"/>
-        </WrapPanel>
-
-        <!-- Row 2: Tasks and Alerts -->
-        <Grid Grid.Row="2">
+        <!-- Row 0: Header / Status -->
+        <Grid Grid.Row="0">
             <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="18"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="24"/>
+                <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
 
-            <GroupBox Header="Tasks" Grid.Column="0" Margin="0,0,10,0">
-                <StackPanel>
-                    <ListBox x:Name="TaskListBox" Height="200">
-                        <ListBox.ContextMenu>
-                            <ContextMenu>
-                                <MenuItem Header="Stop Task" Click="StopTaskMenuItem_Click"/>
-                            </ContextMenu>
-                        </ListBox.ContextMenu>
-                    </ListBox>
-                    <TextBlock Text="Total Tasks:" Margin="0,10,0,0"/>
-                    <TextBlock x:Name="TaskCountLabel" FontWeight="Bold"/>
-                </StackPanel>
-            </GroupBox>
+            <TextBlock x:Name="RoleLabel" FontSize="16" FontWeight="Bold" />
+            <TextBlock Grid.Column="2" Text="Master:" FontWeight="SemiBold"/>
+            <TextBlock x:Name="MasterStatusLabel" Grid.Column="4" Text="Offline"/>
 
-            <GroupBox Header="Alerts" Grid.Column="1">
-                <ListBox x:Name="AlertBox" Height="250"/>
-            </GroupBox>
+            <StackPanel Grid.Column="6" Orientation="Horizontal">
+                <TextBlock Text="Uptime:" Margin="0,0,6,0"/>
+                <TextBlock x:Name="MasterUptimeLabel"/>
+            </StackPanel>
+
+            <!-- Reserve space for app graphic/logo (set Source later if desired) -->
+            <Image x:Name="AppLogo"
+                   Grid.Column="8"
+                   Width="28" Height="28"
+                   Stretch="Uniform"
+                   ToolTip="NodeLink"
+                   Margin="0,2,0,2"/>
         </Grid>
 
-        <!-- Row 3: Nodes -->
-        <GroupBox Header="Nodes" Grid.Row="3" Margin="0,10,0,10">
-            <DataGrid x:Name="NodeGrid" AutoGenerateColumns="False" Height="150">
+        <!-- Row 1: Controls (left cluster + right hamburger) -->
+        <Grid Grid.Row="1" Margin="0,8,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <!-- left control cluster -->
+                <ColumnDefinition Width="*"/>
+                <!-- spacer -->
+                <ColumnDefinition Width="Auto"/>
+                <!-- right: hamburger -->
+            </Grid.ColumnDefinitions>
+
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="Scheduler:" VerticalAlignment="Center"/>
+                <ComboBox x:Name="SchedulerModeDropdown"
+                          SelectionChanged="SchedulerModeDropdown_Changed"
+                          Margin="6,0,0,0" Width="160">
+                    <ComboBoxItem Content="Auto" IsSelected="True"/>
+                    <ComboBoxItem Content="RoundRobin"/>
+                    <ComboBoxItem Content="LeastLoaded"/>
+                </ComboBox>
+                <Button x:Name="RegisterAgentButton" Content="Register Agent" Click="RegisterAgent_Click"/>
+                <Button x:Name="DispatchTaskButton" Content="Dispatch" Click="DispatchTask_Click"/>
+                <Button x:Name="StopAllTasksButton" Content="Stop All" Click="StopAllTasksButton_Click"/>
+                <Button x:Name="BroadcastButton" Content="Broadcast" Click="Broadcast_Click"/>
+
+                <!-- NEW: Compute Test button -->
+                <Button x:Name="ComputeTestButton" Content="Compute Test" Click="ComputeTest_Click"/>
+            </StackPanel>
+
+            <!-- Hide manual custom-task console in v1, keep wiring for future -->
+            <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right" Visibility="Collapsed">
+                <TextBox x:Name="TaskInputBox" ToolTip="Custom task..."/>
+                <Button x:Name="CustomTaskButton" Content="Send Task" Click="CustomTaskButton_Click"/>
+            </StackPanel>
+
+            <!-- Right hamburger dropdown (Account, Settings, Switch Role, Help, About, Save & Exit) -->
+            <Menu Grid.Column="2" HorizontalAlignment="Right" VerticalAlignment="Center">
+                <MenuItem Header="☰" FontSize="20" Padding="8,2">
+                    <MenuItem Header="Account" IsEnabled="False"/>
+                    <Separator/>
+                    <MenuItem Header="Settings" Click="SettingsButton_Click"/>
+                    <MenuItem Header="Switch Role" Click="SwitchRole_Click"/>
+                    <Separator/>
+                    <MenuItem Header="Help" Click="HelpMenu_Click"/>
+                    <MenuItem Header="About" Click="AboutMenu_Click"/>
+                    <Separator/>
+                    <MenuItem Header="Save &amp; Exit" Click="ExitButton_Click"/>
+                </MenuItem>
+            </Menu>
+
+            <!-- Hidden stub so code-behind can still set TaskCountLabel.Text -->
+            <TextBlock x:Name="TaskCountLabel" Grid.Column="2" Visibility="Collapsed"/>
+        </Grid>
+
+        <!-- Row 2: Nodes (full width) -->
+        <GroupBox Grid.Row="2" Header="Nodes" Margin="0,8,0,0">
+            <DataGrid x:Name="NodeGrid"
+                      AutoGenerateColumns="False"
+                      IsReadOnly="True"
+                      CanUserAddRows="False"
+                      CanUserDeleteRows="False"
+                      GridLinesVisibility="None"
+                      RowHeight="32"
+                      MinHeight="240">
+                <!-- ~6 rows visible incl. header -->
                 <DataGrid.Columns>
-                    <DataGridTextColumn Header="ID" Binding="{Binding AgentId}" Width="100"/>
-                    <DataGridTextColumn Header="Status" Binding="{Binding IsOnline, Converter={StaticResource BooleanToStringConverter}}" Width="80"/>
-                    <DataGridTextColumn Header="IP Address" Binding="{Binding IpAddress}" Width="100"/>
-                    <DataGridTextColumn Header="CPU Usage" Binding="{Binding CpuUsagePercent, StringFormat={}{0:F1}%}" Width="80"/>
-                    <DataGridTextColumn Header="Memory" Binding="{Binding MemoryAvailableMB, StringFormat={}{0:F1} MB}" Width="80"/>
-                    <DataGridTextColumn Header="Tasks" Binding="{Binding TaskQueueLength}" Width="60"/>
+                    <!-- Identity -->
+                    <DataGridTextColumn Header="ID" Binding="{Binding AgentId}" Width="200"/>
+                    <DataGridTextColumn Header="IP Address" Binding="{Binding IpAddress}" Width="140"/>
+
+                    <!-- CPU & Memory -->
+                    <DataGridTextColumn Header="CPU %" Binding="{Binding CpuUsagePercent, StringFormat={}{0:F0}}" Width="70"/>
+                    <DataGridTextColumn Header="Mem Avail (MB)" Binding="{Binding MemoryAvailableMB, StringFormat={}{0:F0}}" Width="120"/>
+
+                    <!-- GPU: Yes/No via triggers (no converter needed) -->
+                    <DataGridTextColumn Header="GPU?" Width="60">
+                        <DataGridTextColumn.ElementStyle>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Text" Value="{Binding HasGpu}"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding HasGpu}" Value="True">
+                                        <Setter Property="Text" Value="Yes"/>
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding HasGpu}" Value="False">
+                                        <Setter Property="Text" Value="No"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </DataGridTextColumn.ElementStyle>
+                    </DataGridTextColumn>
+
+                    <DataGridTextColumn Header="GPU Model" Binding="{Binding GpuModel}" Width="*"/>
+                    <DataGridTextColumn Header="VRAM (MB)" Binding="{Binding GpuMemoryMB}" Width="100"/>
+                    <DataGridTextColumn Header="GPU %" Binding="{Binding GpuUsagePercent, StringFormat={}{0:F0}}" Width="70"/>
+
+                    <!-- SoftThreads -->
+                    <DataGridTextColumn Header="SoftThreads (Active)"
+                                        Binding="{Binding TaskQueueLength}"
+                                        Width="Auto" MinWidth="120"/>
+                    <DataGridTextColumn Header="SoftThreads (Cached)"
+                                        Binding="{Binding SoftThreadsQueued, FallbackValue=0, TargetNullValue=0}"
+                                        Width="Auto" MinWidth="140"/>
+                    <DataGridTemplateColumn Header="SoftThreads (Total)" MinWidth="140">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <TextBlock>
+                                    <TextBlock.Text>
+                                        <MultiBinding StringFormat="{}{0}+{1}">
+                                            <Binding Path="TaskQueueLength"/>
+                                            <Binding Path="SoftThreadsQueued" FallbackValue="0" TargetNullValue="0"/>
+                                        </MultiBinding>
+                                    </TextBlock.Text>
+                                </TextBlock>
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+
+                    <!-- NEW: Self-test status (✓ / ✗ / …) -->
+                    <DataGridTextColumn Header="Test" Width="60" Binding="{Binding SelfTestStatus}">
+                        <DataGridTextColumn.ElementStyle>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="HorizontalAlignment" Value="Center"/>
+                                <Setter Property="FontWeight" Value="SemiBold"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding SelfTestStatus}" Value="✓">
+                                        <Setter Property="Foreground" Value="Green"/>
+                                        <Setter Property="FontWeight" Value="Bold"/>
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding SelfTestStatus}" Value="✗">
+                                        <Setter Property="Foreground" Value="Red"/>
+                                        <Setter Property="FontWeight" Value="Bold"/>
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding SelfTestStatus}" Value="…">
+                                        <Setter Property="Foreground" Value="Gray"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </DataGridTextColumn.ElementStyle>
+                    </DataGridTextColumn>
+
                 </DataGrid.Columns>
             </DataGrid>
         </GroupBox>
 
-        <!-- Row 4: Log output -->
-        <ListBox x:Name="LogBox" Grid.Row="4" Margin="0,0,0,0" Height="100"/>
+        <!-- Row 3: Alerts (Tasks hidden but kept for code-behind safety) -->
+        <Grid Grid.Row="3" Margin="0,8,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Keep Tasks UI but collapse it so code-behind references remain valid -->
+            <GroupBox Header="Tasks" Margin="0,0,8,0" Visibility="Collapsed">
+                <ListBox x:Name="TaskListBox">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate DataType="{x:Type core:TaskInfo}">
+                            <Grid Margin="2">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="160"/>
+                                    <ColumnDefinition Width="160"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="{Binding TaskId}" FontWeight="SemiBold" Margin="0,0,8,0"/>
+                                <TextBlock Grid.Column="1" Text="{Binding Description}" />
+                                <TextBlock Grid.Column="2" Text="{Binding AgentId}" />
+                                <TextBlock Grid.Column="3" Text="{Binding Timestamp, StringFormat={}{0:HH:mm:ss}}" />
+                            </Grid>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                    <ListBox.ContextMenu>
+                        <ContextMenu>
+                            <MenuItem Header="Stop Task" Click="StopTaskMenuItem_Click"/>
+                        </ContextMenu>
+                    </ListBox.ContextMenu>
+                </ListBox>
+            </GroupBox>
+
+            <!-- Alerts take full width -->
+            <GroupBox Header="Alerts" Grid.ColumnSpan="2">
+                <ListBox x:Name="AlertBox"/>
+            </GroupBox>
+        </Grid>
+
+        <!-- Row 4: Log -->
+        <GroupBox Grid.Row="4" Header="Log" Margin="0,8,0,0">
+            <ListBox x:Name="LogBox"/>
+        </GroupBox>
     </Grid>
 </Window>
+
+
+
+

@@ -1,0 +1,69 @@
+﻿<Window x:Class="NodeLinkUI.SplashWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Starting..."
+        Width="520" Height="320"
+        WindowStartupLocation="CenterScreen"
+        WindowStyle="None"
+        ResizeMode="NoResize"
+        AllowsTransparency="True"
+        Background="Transparent"
+        ShowInTaskbar="False"
+        Topmost="True">
+
+    <!-- Single root child -->
+    <Border CornerRadius="16"
+            Background="#FF2C2F34"
+            BorderBrush="#553A3F46"
+            BorderThickness="1"
+            Padding="24">
+        <Border.Effect>
+            <DropShadowEffect Color="#000000" BlurRadius="18" ShadowDepth="0" Opacity="0.35"/>
+        </Border.Effect>
+
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <!-- Center branding -->
+            <StackPanel Grid.Row="0" VerticalAlignment="Center" HorizontalAlignment="Center">
+                <TextBlock Text="NODETHREADER"
+                           Foreground="#F0F0F0"
+                           FontSize="34"
+                           FontWeight="SemiBold"
+                           HorizontalAlignment="Center"/>
+                <TextBlock Text="for Windows"
+                           Foreground="#FF9AA1A9"
+                           FontSize="16"
+                           Margin="0,6,0,0"
+                           HorizontalAlignment="Center"/>
+            </StackPanel>
+
+            <!-- Progress -->
+            <ProgressBar Grid.Row="1"
+                         Margin="0,28,0,0"
+                         IsIndeterminate="True"
+                         Height="6"
+                         Foreground="#FF8AA0B5"
+                         Background="#30343A"
+                         BorderBrush="{x:Null}"/>
+
+            <!-- Footer line: version / hint -->
+            <StackPanel Grid.Row="2" Margin="0,10,0,0">
+                <TextBlock x:Name="VersionText"
+                           Foreground="#99D0D5DB"
+                           FontSize="12"
+                           HorizontalAlignment="Center" />
+                <TextBlock Text="Preparing workspace…"
+                           Foreground="#77D0D5DB"
+                           FontSize="12"
+                           Margin="0,2,0,0"
+                           HorizontalAlignment="Center" />
+            </StackPanel>
+        </Grid>
+    </Border>
+</Window>
+

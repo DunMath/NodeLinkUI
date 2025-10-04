@@ -1,6 +1,6 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace NodeCore
 {
@@ -9,7 +9,7 @@ namespace NodeCore
         public string AgentId { get; set; } = "";
         public DateTime LastHeartbeat { get; set; }
         public bool IsOnline { get; set; }
-        public string IpAddress { get; set; } = ""; // Added for NodeGrid
+        public string IpAddress { get; set; } = ""; // For NodeGrid
 
         public float CpuUsagePercent { get; set; }
         public float GpuUsagePercent { get; set; }
@@ -19,34 +19,47 @@ namespace NodeCore
         public bool HasFileAccess { get; set; }
         public string[] AvailableFiles { get; set; } = Array.Empty<string>();
 
-        // 🧠 Performance metrics for scheduling
+        // Performance metrics for scheduling
         public int TaskQueueLength { get; set; }
         public TimeSpan LastTaskDuration { get; set; }
         public float DiskReadMBps { get; set; }
         public float DiskWriteMBps { get; set; }
 
-        // 🟡 Derived property for quick load check
+        // SoftThreads capacity input (Agents should set to Environment.ProcessorCount)
+        public int CpuLogicalCores { get; set; } = 0;
+
+        // Quick load check
         public bool IsBusy => TaskQueueLength > 0 || CpuUsagePercent > 85 || GpuUsagePercent > 85;
 
-        // 🧩 GPU capability reporting (plug-and-play + future CUDA support)
+        // GPU capability reporting (single GPU in v1)
         public bool HasGpu { get; set; }
         public bool HasCuda { get; set; }
         public string GpuModel { get; set; } = "";
         public int GpuMemoryMB { get; set; }
 
-        // ✅ Serialize to JSON
-        public string ToJson()
-        {
-            return JsonSerializer.Serialize(this);
-        }
+        // For Pro upsell (Agent restarts + multi-GPU detection)
+        public int GpuCount { get; set; } = 0;        // number of GPUs on the node
+        public string InstanceId { get; set; } = "";  // unique per NodeLinkUI process run (GUID recommended)
 
-        // ✅ Deserialize from JSON
+        // Master-only display: cached soft threads (not serialized)
+        [JsonIgnore]
+        public int SoftThreadsQueued { get; set; } = 0;
+
+        // Compute test UI indicator (… / ✓ / ✗) – not serialized
+        [JsonIgnore]
+        public string SelfTestStatus { get; set; } = string.Empty;
+
+        // Serialize to JSON (excludes [JsonIgnore] fields)
+        public string ToJson() => JsonSerializer.Serialize(this);
+
+        // Deserialize from JSON
         public static AgentStatus FromJson(string json)
-        {
-            return JsonSerializer.Deserialize<AgentStatus>(json) ?? new AgentStatus();
-        }
+            => JsonSerializer.Deserialize<AgentStatus>(json) ?? new AgentStatus();
     }
 }
+
+
+
 
 
 

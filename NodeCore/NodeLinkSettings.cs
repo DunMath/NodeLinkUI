@@ -23,9 +23,67 @@ namespace NodeCore
         public bool UseGpuGlobally { get; set; } = true;
 
         /// <summary>
+        /// Pro plan toggle. When false, power features are disabled/ignored and UI is greyed out.
+        /// </summary>
+        public bool ProMode { get; set; } = false;
+
+        /// <summary>
+        /// (Pro) Keep this node awake while NodeLinkUI runs (screen may sleep).
+        /// Ignored when ProMode == false.
+        /// </summary>
+        public bool AlwaysOnWhileRunning { get; set; } = false;
+
+        /// <summary>
+        /// (Pro) Agent follows Master power intents (Exit/Sleep/Hibernate/Shutdown).
+        /// Ignored when ProMode == false.
+        /// </summary>
+        public bool FollowMasterPower { get; set; } = true;
+
+        /// <summary>
+        /// (Pro) Minutes the Agent must be idle before acting on power intents.
+        /// </summary>
+        public int AgentIdleMinutesToAct { get; set; } = 5;
+
+        /// <summary>
+        /// (Pro) Minutes to wait after Master lease expiry before considering autonomous action.
+        /// </summary>
+        public int LostMasterWaitMinutes { get; set; } = 10;
+
+        /// <summary>
         /// List of nominated apps available for dispatch.
         /// </summary>
         public List<NominatedApp> NominatedApps { get; set; } = new();
+
+        // ================= SoftThreads settings =================
+
+        /// <summary>
+        /// Maximum concurrent soft threads per logical CPU core (Master pacing).
+        /// Used to compute per-agent capacity: CpuLogicalCores × MaxSoftThreadsPerCore.
+        /// </summary>
+        public int MaxSoftThreadsPerCore { get; set; } = 3;
+
+        // ===================== Security (NEW) ====================
+
+        /// <summary>
+        /// Human-friendly shared secret (Join Code). If set on Master & Agents,
+        /// it’s used to authenticate messages (e.g., HMAC once the channel supports it).
+        /// Stored as plain text; you can swap to DPAPI later if needed.
+        /// </summary>
+        public string JoinCode { get; set; } = "";
+
+        /// <summary>
+        /// When true, nodes that don’t present a valid Join Code should be rejected.
+        /// You can consult this flag where you enforce admission.
+        /// </summary>
+        public bool ProhibitUnauthenticated { get; set; } = true;
+
+        /// <summary>
+        /// Optional: bind comms to a specific local IP (e.g., your LAN NIC).
+        /// Empty = bind to Any. Safe to remove if you don’t want this.
+        /// </summary>
+        public string BindAddress { get; set; } = "";
+
+        // ========================================================
 
         /// <summary>
         /// Save settings to a JSON file.
@@ -37,7 +95,8 @@ namespace NodeCore
         }
 
         /// <summary>
-        /// Load settings from a JSON file, or return defaults if not found.
+        /// Load settings from a JSON file, or return defaults if not found/corrupt.
+        /// Missing properties in older files will use the defaults above.
         /// </summary>
         public static NodeLinkSettings Load(string path = "settings.json")
         {
@@ -48,7 +107,7 @@ namespace NodeCore
                     var json = File.ReadAllText(path);
                     return JsonSerializer.Deserialize<NodeLinkSettings>(json) ?? new NodeLinkSettings();
                 }
-                catch (Exception)
+                catch
                 {
                     // If file is corrupt, fall back to defaults
                     return new NodeLinkSettings();
@@ -63,12 +122,15 @@ namespace NodeCore
         /// <summary>
         /// Display name of the app.
         /// </summary>
-        public string Name { get; set; }
+        public string Name { get; set; } = string.Empty;
 
         /// <summary>
         /// Path to the executable or launch command.
         /// </summary>
-        public string Path { get; set; }
+        public string Path { get; set; } = string.Empty;
+
+        // Add PreferredAgent or other fields later if needed (Pro-only).
     }
 }
+
 
