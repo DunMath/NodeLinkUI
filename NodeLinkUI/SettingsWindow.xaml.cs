@@ -17,9 +17,8 @@ namespace NodeLinkUI
     {
         private readonly NodeLinkSettings settings;
         private readonly List<AgentStatus> agentStatuses;
-        private readonly bool isProVersion; // kept for signature parity; logic uses settings.ProMode
+        private readonly bool isProVersion;
 
-        // Live collection bound to the ListBox
         private readonly ObservableCollection<NominatedApp> _apps;
 
         public SettingsWindow(NodeLinkSettings settings, List<AgentStatus> agentStatuses, bool isProVersion)
@@ -30,36 +29,25 @@ namespace NodeLinkUI
             this.agentStatuses = agentStatuses ?? new List<AgentStatus>();
             this.isProVersion = isProVersion;
 
-            // Bind simple fields directly to settings (XAML bindings)
-            DataContext = this.settings;
+            // Seed UI from settings
+            MasterIpTextBox.Text = this.settings.MasterIp ?? string.Empty;
+            HeartbeatIntervalTextBox.Text = Math.Max(1000, this.settings.HeartbeatIntervalMs).ToString();
+            UseGpuCheckBox.IsChecked = this.settings.UseGpuGlobally;
 
-            // Build live collection from persisted apps; filter + de-dupe by Path
+            // Start role dropdown (0 = Master, 1 = Agent)
+            StartRoleCombo.SelectedIndex = this.settings.StartAsMaster ? 0 : 1;
+
+            // Nominated apps collection
             _apps = new ObservableCollection<NominatedApp>(
-                (settings.NominatedApps ?? new List<NominatedApp>())
+                (this.settings.NominatedApps ?? new List<NominatedApp>())
                 .Where(a => a != null && !string.IsNullOrWhiteSpace(a.Path))
                 .GroupBy(a => a.Path, StringComparer.OrdinalIgnoreCase)
                 .Select(g => Normalize(g.First()))
             );
-
-            // Hook ListBox (do NOT set DisplayMemberPath when using ItemTemplate in XAML)
             SelectedAppsListBox.ItemsSource = _apps;
             SelectedAppsListBox.MouseDoubleClick += SelectedAppsListBox_MouseDoubleClick;
 
-            // Populate PreferredAgent choices only in Pro (if the control exists)
-            if (this.settings.ProMode)
-            {
-                var ids = this.agentStatuses
-                    .Where(a => !string.IsNullOrWhiteSpace(a.AgentId))
-                    .Select(a => a.AgentId)
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .OrderBy(s => s)
-                    .ToList();
-
-                if (FindName("PreferredAgentComboBox") is ComboBox pref)
-                    pref.ItemsSource = ids;
-            }
-
-            // --------- Security (Join Code) seed UI if the controls exist ----------
+            // Security (Join Code) seed
             SeedJoinCodeControls();
         }
 
@@ -77,7 +65,6 @@ namespace NodeLinkUI
             {
                 var path = dialog.FileName;
 
-                // Prevent duplicates by path
                 if (_apps.Any(a => string.Equals(a.Path, path, StringComparison.OrdinalIgnoreCase)))
                 {
                     MessageBox.Show("That application is already in the list.", "Duplicate",
@@ -106,16 +93,9 @@ namespace NodeLinkUI
 
         private void SelectedAppsListBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
-            if (SelectedAppsListBox.SelectedItem is NominatedApp app)
-            {
-                AppNameTextBox.Text = app?.Name ?? string.Empty;
-                AppPathTextBox.Text = app?.Path ?? string.Empty;
-            }
-            else
-            {
-                AppNameTextBox.Text = string.Empty;
-                AppPathTextBox.Text = string.Empty;
-            }
+            var app = SelectedAppsListBox.SelectedItem as NominatedApp;
+            AppNameTextBox.Text = app?.Name ?? string.Empty;
+            AppPathTextBox.Text = app?.Path ?? string.Empty;
         }
 
         // Double-click to launch the selected app
@@ -125,11 +105,12 @@ namespace NodeLinkUI
             OpenApp(app);
         }
 
-        // Optional button handler if you add an "Open" button per item
         private void OpenAppButton_Click(object sender, RoutedEventArgs e)
         {
             if ((sender as FrameworkElement)?.DataContext is NominatedApp app)
                 OpenApp(app);
+            else if (SelectedAppsListBox.SelectedItem is NominatedApp sel)
+                OpenApp(sel);
         }
 
         private void OpenApp(NominatedApp app)
@@ -156,79 +137,55 @@ namespace NodeLinkUI
             }
         }
 
-        // ---------- Security (Join Code) handlers (safe even if controls aren’t in XAML) ----------
+        // ---------- Security (Join Code) ----------
 
         private void SeedJoinCodeControls()
         {
-            var secret = FindName("JoinCodeSecret") as PasswordBox;
-            var plain = FindName("JoinCodePlain") as TextBox;
-            var show = FindName("ShowCodeCheckBox") as CheckBox;
-
-            if (secret == null || plain == null || show == null)
-                return; // XAML not updated yet; skip
-
             var code = settings.JoinCode ?? string.Empty;
             code = SecurityManager.NormalizeCode(code);
 
-            secret.Password = code;
-            plain.Text = code;
-            show.IsChecked = false; // start masked
-            SyncJoinCodeVisibility();
+            JoinCodeSecret.Password = code;
+            JoinCodePlain.Text = code;
+
+            JoinCodePlain.Visibility = Visibility.Collapsed;
+            JoinCodeSecret.Visibility = Visibility.Visible;
+            ShowCodeCheckBox.IsChecked = false;
         }
 
-        // wired up by XAML if present
         private void ShowCodeCheckBox_Checked(object sender, RoutedEventArgs e) => SyncJoinCodeVisibility();
         private void ShowCodeCheckBox_Unchecked(object sender, RoutedEventArgs e) => SyncJoinCodeVisibility();
 
         private void SyncJoinCodeVisibility()
         {
-            var secret = FindName("JoinCodeSecret") as PasswordBox;
-            var plain = FindName("JoinCodePlain") as TextBox;
-            var show = FindName("ShowCodeCheckBox") as CheckBox;
-
-            if (secret == null || plain == null || show == null)
-                return;
-
-            bool isShow = show.IsChecked == true;
+            bool isShow = ShowCodeCheckBox.IsChecked == true;
             if (isShow)
             {
-                plain.Text = secret.Password;
-                plain.Visibility = Visibility.Visible;
-                secret.Visibility = Visibility.Collapsed;
-                plain.Focus();
-                plain.CaretIndex = plain.Text.Length;
+                JoinCodePlain.Text = JoinCodeSecret.Password;
+                JoinCodePlain.Visibility = Visibility.Visible;
+                JoinCodeSecret.Visibility = Visibility.Collapsed;
+                JoinCodePlain.Focus();
+                JoinCodePlain.CaretIndex = JoinCodePlain.Text.Length;
             }
             else
             {
-                secret.Password = plain.Text;
-                secret.Visibility = Visibility.Visible;
-                plain.Visibility = Visibility.Collapsed;
-                secret.Focus();
+                JoinCodeSecret.Password = JoinCodePlain.Text;
+                JoinCodeSecret.Visibility = Visibility.Visible;
+                JoinCodePlain.Visibility = Visibility.Collapsed;
+                JoinCodeSecret.Focus();
             }
         }
 
-        // wired up by XAML if present
         private void GenerateJoinCodeButton_Click(object sender, RoutedEventArgs e)
         {
-            var secret = FindName("JoinCodeSecret") as PasswordBox;
-            var plain = FindName("JoinCodePlain") as TextBox;
-            if (secret == null || plain == null) return;
-
             var newCode = SecurityManager.GenerateJoinCode();
             var norm = SecurityManager.NormalizeCode(newCode);
-            secret.Password = norm;
-            plain.Text = norm;
+            JoinCodeSecret.Password = norm;
+            JoinCodePlain.Text = norm;
         }
 
-        // wired up by XAML if present
         private void CopyJoinCodeButton_Click(object sender, RoutedEventArgs e)
         {
-            var secret = FindName("JoinCodeSecret") as PasswordBox;
-            var plain = FindName("JoinCodePlain") as TextBox;
-            var show = FindName("ShowCodeCheckBox") as CheckBox;
-            if (secret == null || plain == null || show == null) return;
-
-            var code = show.IsChecked == true ? plain.Text : secret.Password;
+            var code = (ShowCodeCheckBox.IsChecked == true) ? JoinCodePlain.Text : JoinCodeSecret.Password;
             code = SecurityManager.NormalizeCode(code);
             if (!string.IsNullOrWhiteSpace(code))
                 Clipboard.SetText(code);
@@ -238,7 +195,7 @@ namespace NodeLinkUI
 
         private void SaveButton_Click(object sender, RoutedEventArgs e)
         {
-            // Validate heartbeat interval
+            // Validate heartbeat
             if (!int.TryParse(HeartbeatIntervalTextBox.Text, out int interval) || interval < 1000)
             {
                 MessageBox.Show("Heartbeat interval must be a number ≥ 1000 ms.", "Invalid Input",
@@ -246,49 +203,57 @@ namespace NodeLinkUI
                 return;
             }
 
-            // Persist form → settings (bindings also do this; set explicitly for clarity)
-            settings.MasterIp = MasterIpTextBox.Text?.Trim() ?? string.Empty;
+            // Capture current start-role before overwrite
+            bool oldStartAsMaster = settings.StartAsMaster;
+
+            // Persist fields
+            settings.MasterIp = (MasterIpTextBox.Text ?? string.Empty).Trim();
             settings.HeartbeatIntervalMs = interval;
-            settings.UseGpuGlobally = UseGpuGloballyCheck();
+            settings.UseGpuGlobally = UseGpuCheckBox.IsChecked == true;
 
-            // Security: capture code if controls exist
-            string captured = "";
-            if (FindName("ShowCodeCheckBox") is CheckBox show)
-            {
-                if (show.IsChecked == true && FindName("JoinCodePlain") is TextBox plain)
-                    captured = plain.Text ?? "";
-                else if (FindName("JoinCodeSecret") is PasswordBox secret)
-                    captured = secret.Password ?? "";
-            }
+            // Role from dropdown
+            settings.StartAsMaster = (StartRoleCombo.SelectedIndex == 0);
 
+            // Security: capture join code
+            string captured = ShowCodeCheckBox.IsChecked == true ? (JoinCodePlain.Text ?? "") : (JoinCodeSecret.Password ?? "");
             if (!string.IsNullOrWhiteSpace(captured))
-            {
                 SecurityManager.TrySetJoinCode(settings, captured);
-            }
-            // ProhibitUnauthenticated is bound in XAML; no extra work needed
 
-            // Commit all apps back to settings (persist EVERY item)
+            // Apps back to settings
             settings.NominatedApps = _apps
                 .Where(a => a != null && !string.IsNullOrWhiteSpace(a.Path))
                 .GroupBy(a => a.Path, StringComparer.OrdinalIgnoreCase)
                 .Select(g => Normalize(g.First()))
                 .ToList();
 
+            // Save to disk
             settings.Save(); // writes settings.json
 
-            // Apply to live comms without touching private fields
+            // Let MainWindow update live comm security if needed
             if (this.Owner is MainWindow mw)
             {
                 try { mw.RefreshCommunicationSecurity(); } catch { /* ignore */ }
             }
 
+            // If role changed, prompt to restart now
+            if (oldStartAsMaster != settings.StartAsMaster && this.Owner is MainWindow ownerMw)
+            {
+                var newRole = settings.StartAsMaster ? NodeRole.Master : NodeRole.Agent;
+                var res = MessageBox.Show(
+                    $"Role will change to {newRole} on restart.\n\nRestart now?",
+                    "Restart Required",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Question);
+
+                if (res == MessageBoxResult.Yes)
+                {
+                    ownerMw.RestartIntoRole(newRole);
+                    return; // won’t reach Close()
+                }
+            }
+
             DialogResult = true;
             Close();
-        }
-
-        private bool UseGpuGloballyCheck()
-        {
-            return (FindName("UseGpuCheckBox") as CheckBox)?.IsChecked ?? false;
         }
 
         private void CancelButton_Click(object sender, RoutedEventArgs e)
@@ -309,6 +274,9 @@ namespace NodeLinkUI
         }
     }
 }
+
+
+
 
 
 

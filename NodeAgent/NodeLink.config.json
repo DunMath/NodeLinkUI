@@ -1,0 +1,10 @@
+﻿{
+  "UseHttpControlPlane": true,
+  "UseLegacyUdpRegistration": false,
+  "UseLegacyUdpKeepAlive": false,
+  "ControlPort": 50555,
+  "AuthToken": "changeme-dev",
+  "HealthPollSeconds": 15,
+  "Version": "1.0.1",
+  "MdnsService": "_nodelink._tcp"
+}

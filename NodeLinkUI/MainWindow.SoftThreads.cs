@@ -1,176 +1,240 @@
 ﻿// File: NodeLinkUI/MainWindow.SoftThreads.cs
+// NodeLinkUI/MainWindow.SoftThreads.cs — v1 functional SoftThreads
 using System;
+using System.Collections.Concurrent;
 using System.Linq;
-using System.Windows.Controls;
-using System.Windows.Threading;
-using NodeCore;
-using NodeLinkUI.Services;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace NodeLinkUI
 {
     public partial class MainWindow
     {
-        // Only this field is declared here (the others likely exist in another partial).
-        private DispatcherTimer _softUiTimer;
-
-        /// <summary>
-        /// Call from your Master role initialization (after agentStatuses are bound).
-        /// </summary>
-        private void InitializeSoftThreadsForMaster()
+        // -------- AGENT SIDE: a small single-consumer work queue --------
+        private sealed class AgentWorkQueue : IDisposable
         {
-            // Ensure default exists even if settings.json was older
-            if (settings.MaxSoftThreadsPerCore <= 0)
-                settings.MaxSoftThreadsPerCore = 3;
+            private readonly MainWindow _owner;
+            private readonly ConcurrentQueue<string> _q = new();
+            private readonly CancellationTokenSource _cts = new();
+            private readonly Task _worker;
 
-            _softDispatcher ??= new SoftThreadDispatcher(
-                sendFunc: (payload, agentId) =>
-                {
-                    master?.DispatchTaskToAgent(payload, agentId);
-                    return true;
-                },
-                getStatuses: () => agentStatuses,
-                settings: settings,
-                log: Log,
-                flushIntervalMs: 60
-            );
+            public int Count => _q.Count;
 
-            // Light UI refresher (optional; harmless if summary controls don't exist)
-            _softUiTimer ??= new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
-            _softUiTimer.Tick -= SoftUiTimer_Tick;
-            _softUiTimer.Tick += SoftUiTimer_Tick;
-            _softUiTimer.Start();
-        }
-
-        /// <summary>
-        /// Call from your Agent role initialization (after agentStatuses are bound).
-        /// </summary>
-        private void InitializeSoftThreadsForAgent()
-        {
-            _agentWork ??= new AgentWorkQueue(
-                async (payload) =>
-                {
-                    // TODO: Replace with actual execution of 'payload'
-                    await System.Threading.Tasks.Task.Delay(50);
-                    comm.SendToMaster($"Result:{payload}:OK");
-                },
-                Log
-            );
-        }
-
-        private void SoftUiTimer_Tick(object sender, EventArgs e) => UpdateSoftThreadStats();
-
-        /// <summary>
-        /// Safe UI updater for Soft Threads summary; ok if controls are not present.
-        /// Also pushes per-agent "cached" counts into AgentStatus.SoftThreadsQueued.
-        /// </summary>
-        private void UpdateSoftThreadStats()
-        {
-            if (currentRole != NodeRole.Master) return;
-
-            try
+            public AgentWorkQueue(MainWindow owner)
             {
-                int capacity = 0;
-                int agentQueues = 0;
+                _owner = owner ?? throw new ArgumentNullException(nameof(owner));
+                _worker = Task.Run(WorkerLoopAsync);
+            }
 
-                foreach (var a in agentStatuses)
+            public void Enqueue(string message)
+            {
+                if (string.IsNullOrWhiteSpace(message)) return;
+                _q.Enqueue(message);
+            }
+
+            private async Task WorkerLoopAsync()
+            {
+                var ct = _cts.Token;
+                while (!ct.IsCancellationRequested)
                 {
-                    if (string.Equals(a.AgentId, "Master", StringComparison.OrdinalIgnoreCase))
-                        continue;
-
-                    int cores = a.CpuLogicalCores > 0 ? a.CpuLogicalCores : 4;
-                    capacity += Math.Max(1, settings.MaxSoftThreadsPerCore * cores);
-                    agentQueues += Math.Max(0, a.TaskQueueLength);
-                }
-
-                int queued = 0, pendingLocal = 0;
-
-                // Fill per-agent cached counts (queued+pending) from dispatcher
-                var per = _softDispatcher?.SnapshotPerAgent();
-                if (_softDispatcher != null)
-                {
-                    var totals = _softDispatcher.GetTotals();
-                    queued = totals.Queued;
-                    pendingLocal = totals.PendingLocal;
-
-                    if (per != null)
+                    try
                     {
-                        foreach (var a in agentStatuses)
+                        if (!_q.TryDequeue(out var msg))
                         {
-                            if (string.Equals(a.AgentId, "Master", StringComparison.OrdinalIgnoreCase))
-                                continue;
-
-                            if (per.TryGetValue(a.AgentId, out var v))
-                                a.SoftThreadsQueued = Math.Max(0, v.Queued + v.Pending);
-                            else
-                                a.SoftThreadsQueued = 0;
+                            await Task.Delay(50, ct);
+                            continue;
                         }
 
-                        // Refresh the grid so the new column updates
-                        Dispatcher.Invoke(() =>
-                        {
-                            if (NodeGrid != null)
-                            {
-                                NodeGrid.ItemsSource = null;
-                                NodeGrid.ItemsSource = agentStatuses;
-                            }
-                        });
+                        await HandleMessageAsync(msg, ct);
+                    }
+                    catch (OperationCanceledException) { break; }
+                    catch
+                    {
+                        // keep going
                     }
                 }
-
-                int active = agentQueues + pendingLocal;
-
-                // Update summary text if present
-                if (TryFind<TextBlock>("SoftThreadSummaryText") is TextBlock summary)
-                    summary.Text = $"Soft Threads: Active {active}/{capacity} • Queued {queued}";
-
-                // Update capacity bar if present
-                if (TryFind<ProgressBar>("SoftThreadCapacityBar") is ProgressBar bar)
-                {
-                    bar.Maximum = Math.Max(1, capacity);
-                    bar.Value = Math.Min(active, capacity);
-                }
             }
-            catch
+
+            private async Task HandleMessageAsync(string msg, CancellationToken ct)
             {
-                // swallow timing/race UI errors
+                // Very small “work” simulation so we can test end-to-end
+                if (msg.StartsWith("Compute:", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Format: Compute:{app}|{seq}|{payload}
+                    var payload = msg.Substring("Compute:".Length);
+                    string app = "App";
+                    int seq = 0;
+
+                    try
+                    {
+                        var parts = payload.Split('|');
+                        if (parts.Length >= 2)
+                        {
+                            app = parts[0];
+                            _ = int.TryParse(parts[1], out seq);
+                        }
+                    }
+                    catch { /* best-effort parse */ }
+
+                    await Task.Delay(150, ct); // simulate work
+
+                    // Report both a simple Result and a ComputeResult (so either handler can pick it up)
+                    _owner.comm.SendToMaster($"Result:OK:{app}|{seq}");
+                    _owner.comm.SendToMaster($"ComputeResult:{app}|{seq}:OK");
+                    _owner.Log($"Agent executed {app} seq {seq}");
+                    return;
+                }
+
+                if (msg.StartsWith("CustomTask:", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Format: CustomTask:{taskId}:{text}
+                    await Task.Delay(120, ct);
+                    _owner.comm.SendToMaster($"Result:CustomTaskDone:{msg}");
+                    _owner.Log("Agent completed custom task.");
+                    return;
+                }
+
+                // Unknown → just acknowledge so upstream doesn’t stall
+                await Task.Delay(30, ct);
+                _owner.comm.SendToMaster($"Result:Acknowledged:{msg}");
+            }
+
+            public void Dispose()
+            {
+                try { _cts.Cancel(); } catch { }
+                try { _worker.Wait(500); } catch { }
+                _cts.Dispose();
             }
         }
 
-        /// <summary>
-        /// Call on app exit/restart to clean up timers/queues.
-        /// </summary>
+        // -------- MASTER SIDE: a simple dispatcher with cached/in-flight counts --------
+        private sealed class SoftThreadDispatcher : IDisposable
+        {
+            private readonly MainWindow _owner;
+            private readonly ConcurrentQueue<(string agentId, string taskId, string payload)> _cache = new();
+            private int _inflight;
+            private readonly CancellationTokenSource _cts = new();
+            private readonly Task _pump;
+
+            public int InFlightCount => _inflight;
+            public int CachedCount => _cache.Count;
+
+            public SoftThreadDispatcher(MainWindow owner)
+            {
+                _owner = owner ?? throw new ArgumentNullException(nameof(owner));
+                _pump = Task.Run(PumpLoopAsync);
+            }
+
+            public void Enqueue(string agentId, string taskId, string payload)
+            {
+                if (string.IsNullOrWhiteSpace(agentId) || string.IsNullOrWhiteSpace(payload)) return;
+                _cache.Enqueue((agentId, taskId, payload));
+            }
+
+            private async Task PumpLoopAsync()
+            {
+                var ct = _cts.Token;
+                while (!ct.IsCancellationRequested)
+                {
+                    try
+                    {
+                        if (!_cache.TryDequeue(out var item))
+                        {
+                            await Task.Delay(40, ct);
+                            continue;
+                        }
+
+                        Interlocked.Increment(ref _inflight);
+
+                        // Try NodeMaster first, fall back to direct comms
+                        bool sent = false;
+                        try
+                        {
+                            if (_owner.master != null)
+                            {
+                                _owner.master.DispatchTaskToAgent(item.payload, item.agentId);
+                                sent = true;
+                            }
+                            else
+                            {
+                                sent = _owner.comm.SendToAgent(item.agentId, item.payload);
+                            }
+                        }
+                        catch { sent = false; }
+
+                        if (!sent)
+                        {
+                            // Couldn’t send: requeue and backoff
+                            _cache.Enqueue(item);
+                            await Task.Delay(200, ct);
+                            Interlocked.Decrement(ref _inflight);
+                            continue;
+                        }
+
+                        // Small pacing to avoid blasting a single agent
+                        await Task.Delay(10, ct);
+                    }
+                    catch (OperationCanceledException) { break; }
+                    catch
+                    {
+                        // keep pumping
+                    }
+                    finally
+                    {
+                        // InFlight is decremented by OnResultReceived; as a safety guard,
+                        // ensure it never goes negative.
+                        if (_inflight < 0) Interlocked.Exchange(ref _inflight, 0);
+                    }
+                }
+            }
+
+            public void OnResultReceived(string agentId)
+            {
+                // For now we assume one result per enqueued work item.
+                if (Interlocked.Decrement(ref _inflight) < 0)
+                    Interlocked.Exchange(ref _inflight, 0);
+            }
+
+            public void Dispose()
+            {
+                try { _cts.Cancel(); } catch { }
+                try { _pump.Wait(500); } catch { }
+                _cts.Dispose();
+            }
+        }
+
+        // -------- Wiring into MainWindow --------
+
+        private SoftThreadDispatcher? _softDispatcher;
+        private AgentWorkQueue? _agentWork;
+
+        // Called during role initialization in MainWindow.xaml.cs
+        private void InitializeSoftThreadsForMaster()
+        {
+            _softDispatcher = new SoftThreadDispatcher(this);
+        }
+
+        private void InitializeSoftThreadsForAgent()
+        {
+            _agentWork = new AgentWorkQueue(this);
+        }
+
         private void DisposeSoftThreads()
         {
-            try
-            {
-                if (_softUiTimer != null)
-                {
-                    _softUiTimer.Stop();
-                    _softUiTimer.Tick -= SoftUiTimer_Tick;
-                    _softUiTimer = null;
-                }
-
-                _agentWork?.Dispose();
-                _agentWork = null;
-
-                _softDispatcher?.Dispose();
-                _softDispatcher = null;
-            }
-            catch
-            {
-                // no-op
-            }
+            try { _softDispatcher?.Dispose(); } catch { }
+            try { _agentWork?.Dispose(); } catch { }
+            _softDispatcher = null;
+            _agentWork = null;
         }
 
-        /// <summary>
-        /// Small helper: safe lookup of XAML-named controls without hard dependency.
-        /// </summary>
-        private T TryFind<T>(string name) where T : class
+        // Optional: update any UI counters tied to soft threads (safe no-op if unbound)
+        private void UpdateSoftThreadStats()
         {
-            return FindName(name) as T;
+            // If you later add columns for in-flight/cached, you can propagate counts here.
+            // Example:
+            // var me = agentStatuses.FirstOrDefault(a => a.AgentId == "Master");
+            // if (me != null && _softDispatcher != null) { ... }
         }
     }
 }
-
-
 

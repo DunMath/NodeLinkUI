@@ -1,79 +1,99 @@
-﻿using System;
+﻿// NodeMaster/NodeMaster.cs  — SIMPLE snapshot + dispatch (no ref returns, no AgentCount)
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using NodeComm;
 using NodeCore;
-using NodeCore.Scheduling;
 
 namespace NodeMaster
 {
     public class NodeMaster
     {
         private readonly CommChannel comm;
-        private Dictionary<string, AgentStatus> agents = new();
-        private NodeScheduler scheduler;
+
+        // Optional internal snapshot (UI can ignore this if it keeps its own list)
+        private readonly Dictionary<string, AgentStatus> agents =
+            new(StringComparer.OrdinalIgnoreCase);
 
         public NodeMaster(CommChannel comm)
         {
-            this.comm = comm;
-            comm.RegisterMaster(ReceiveAgentStatus);
+            this.comm = comm ?? throw new ArgumentNullException(nameof(comm));
         }
 
-        // 🧠 Receive heartbeat from agent
-        public void ReceiveAgentStatus(string json)
+        /// <summary>Ask running agents to announce themselves.</summary>
+        public void NudgeAgents()
         {
-            var status = AgentStatus.FromJson(json);
-            agents[status.AgentId] = status;
-
-            Console.WriteLine($"Heartbeat received from {status.AgentId} | CPU: {status.CpuUsagePercent}% | Tasks: {status.TaskQueueLength}");
+            try { comm.Broadcast("WhoIsAlive"); }
+            catch { /* ignore */ }
         }
 
-        // 📤 Dispatch task to specific agent
+        /// <summary>Send a payload directly to a specific agent.</summary>
         public void DispatchTaskToAgent(string task, string agentId)
         {
-            if (agents.TryGetValue(agentId, out var agent))
-            {
-                comm.SendToAgent(agentId, task);
-                Console.WriteLine($"Dispatched task '{task}' to agent '{agentId}'");
-            }
-            else
-            {
-                Console.WriteLine($"Agent '{agentId}' not found — task not dispatched.");
-            }
+            if (string.IsNullOrWhiteSpace(agentId)) return;
+            comm.SendToAgent(agentId, task);
         }
 
-        // 🧠 Dispatch task using scheduler
+        /// <summary>Very small “random” scheduler across the agents snapshot.</summary>
         public void DispatchTask(string task)
         {
-            var agentList = agents.Values.ToList();
-            scheduler = new NodeScheduler(agentList);
-
-            string selectedAgentId = scheduler.SelectAgent(task);
-
-            if (selectedAgentId != "None")
-            {
-                DispatchTaskToAgent(task, selectedAgentId);
-            }
-            else
-            {
-                Console.WriteLine("No suitable agent found for task dispatch.");
-            }
+            if (agents.Count == 0) return;
+            // pick the first online agent for simplicity
+            var target = agents.Values.FirstOrDefault(a => a.IsOnline && !a.AgentId.Equals("Master", StringComparison.OrdinalIgnoreCase))
+                         ?? agents.Values.FirstOrDefault(a => !a.AgentId.Equals("Master", StringComparison.OrdinalIgnoreCase));
+            if (target != null) DispatchTaskToAgent(task, target.AgentId);
         }
 
-        // 📡 Register agent with master
-        public void RegisterAgent(string agentId, Action<string> receiver)
+        public List<AgentStatus> GetAgentStatuses() => agents.Values.ToList();
+
+        // (Optional) keep a basic mirror if the UI wants to push updates here
+        public void UpdateFromConfig(AgentConfig cfg)
         {
-            comm.Register(agentId, receiver);
-            Console.WriteLine($"Agent '{agentId}' registered with master.");
+            if (cfg == null || string.IsNullOrWhiteSpace(cfg.AgentId)) return;
+
+            if (!agents.TryGetValue(cfg.AgentId, out var row))
+            {
+                row = new AgentStatus { AgentId = cfg.AgentId };
+                agents[cfg.AgentId] = row;
+            }
+
+            row.CpuLogicalCores = cfg.CpuLogicalCores;
+            row.HasGpu = cfg.HasGpu;
+            row.GpuModel = cfg.GpuModel ?? "";
+            row.GpuMemoryMB = cfg.GpuMemoryMB;
+            row.GpuCount = cfg.GpuCount;
+            row.InstanceId = cfg.InstanceId ?? "";
+            row.IsOnline = true;
+            row.LastHeartbeat = DateTime.Now;
         }
 
-        // 📊 Get current agent telemetry snapshot
-        public List<AgentStatus> GetAgentStatuses()
+        public void UpdateFromPulse(AgentPulse p)
         {
-            return agents.Values.ToList();
+            if (p == null || string.IsNullOrWhiteSpace(p.AgentId)) return;
+
+            if (!agents.TryGetValue(p.AgentId, out var row))
+            {
+                row = new AgentStatus { AgentId = p.AgentId };
+                agents[p.AgentId] = row;
+            }
+
+            row.CpuUsagePercent = Clamp01to100(p.CpuUsagePercent);
+            row.MemoryAvailableMB = p.MemoryAvailableMB;
+            row.GpuUsagePercent = Clamp01to100(p.GpuUsagePercent);
+            row.TaskQueueLength = p.TaskQueueLength;
+            row.NetworkMbps = p.NetworkMbps;
+            row.DiskReadMBps = p.DiskReadMBps;
+            row.DiskWriteMBps = p.DiskWriteMBps;
+            row.LastHeartbeat = p.LastHeartbeat == default ? DateTime.Now : p.LastHeartbeat;
+            row.IsOnline = true;
         }
+
+        private static float Clamp01to100(float v) =>
+            (float)Math.Max(0, Math.Min(100, v));
     }
 }
+
+
 
 
 

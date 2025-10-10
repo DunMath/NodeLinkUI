@@ -7,6 +7,7 @@ namespace NodeCore
 {
     public class NodeLinkSettings
     {
+        public bool StartAsMaster { get; set; } = false;
         /// <summary>
         /// IP address of the master node.
         /// </summary>

@@ -1,41 +1,58 @@
-﻿using NodeComm;
+﻿// MainWindow.xaml.cs  — LITE + SoftThreads wiring + Rolling master.log + Open Logs menu
+// Keeps: StartAsMaster from settings, WhoIsAlive, AgentConfig/AgentPulse, UpdateAgentConfig
+// Adds: BroadcastPing, ComputeTestResult parser (✓ / ✗ and OK/FAIL), rolling master.log, Open Logs handler
+// Fixes: CPU usage probe (uses PerformanceCounter), presence smoothing, no zero flicker on pulse
+//
+// v1.0.1 changes:
+// - [B] Auto-register on discovery: call MasterBootstrapper.OnAgentDiscovered(row) after adding/updating an agent.
+// - [C] Register button uses HTTP RegistrationClient.TryRegisterAsync(...) instead of UDP broadcast.
+// - [D] Minimal config access via NodeLinkConfig.Load() to get ControlPort/AuthToken defaults.
+
+using NodeComm;
 using NodeCore;
 using NodeCore.Scheduling;
 using NodeMaster;
 using NodeAgent;
+using NodeAgent.Bootstrap;  // AgentBootstrapper.Start(...)
+
 
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Management;
 using System.Net;
 using System.Net.NetworkInformation;
-using System.Runtime.InteropServices;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading.Tasks;
 using System.Timers;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Data;
 using System.Windows.Media;
 
 using Makaretu.Dns;
-using NodeLinkUI.Services;
+
+// v1.0.1: new usings for control plane integration
+using NodeCore.Config;              // NodeLinkConfig.Load()
+using NodeMaster.Bootstrap;         // MasterBootstrapper.Initialize/OnAgentDiscovered
+using MasterApp;                    // RegistrationClient
+using NodeCore.Protocol;            // Proto constants (Version/DefaultControlPort)
 
 namespace NodeLinkUI
 {
     public partial class MainWindow : Window
     {
-        // ===================== Constants =====================
         private const string ServiceTypeMaster = "_nodelink._tcp";
         private const string ServiceTypeAgent = "_nodelink-agent._tcp";
         private const string configPath = "node.config";
         private const string settingsPath = "settings.json";
 
-        // ===================== Core state =====================
         private NodeRole currentRole;
         private CommChannel comm;
         private NodeMaster.NodeMaster? master;
@@ -43,72 +60,85 @@ namespace NodeLinkUI
         private NodeScheduler? scheduler;
         private SchedulerMode selectedMode = SchedulerMode.Auto;
 
-        private List<AgentStatus> agentStatuses = new();
-        private List<string> taskHistory = new();
+        private ObservableCollection<AgentStatus> agentStatuses = new();
         private ObservableCollection<TaskInfo> tasks = new();
+        private List<string> taskHistory = new();
 
-        private System.Timers.Timer heartbeatTimer;
+        private ICollectionView? agentView;
+        private string? _selectedAgentId;
+
+        private System.Timers.Timer heartbeatTimer = default!;
         private DateTime masterStartTime;
-        private int agentCount = 0;
-        private bool IsProVersion = false; // visual flag only; functional Pro checks use settings.ProMode
-        private int taskSequenceId = 0;
 
+        private int taskSequenceId = 0;
         private readonly Dictionary<string, List<(int SequenceId, string Result)>> computeResults = new();
+
         private NodeLinkSettings settings = new();
 
-        // Per-run instance id (changes every time this process starts)
+        // Agent numbering (sticky labels)
+        private Dictionary<string, int> _agentNumberMap = new(StringComparer.OrdinalIgnoreCase);
+        private const string AgentNumberMapPath = "agents.map.json";
+
+        // Presence smoothing
+        private readonly Dictionary<string, DateTime> _lastSeenUtc = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly TimeSpan OfflineAfter = TimeSpan.FromSeconds(8);
+        private static readonly TimeSpan RemoveAfter = TimeSpan.FromSeconds(60);
+
+        // IDs / mDNS
         private readonly string _thisInstanceId = Guid.NewGuid().ToString();
-
-        // Track last seen agent InstanceId to detect agent restarts (Master side)
-        private readonly Dictionary<string, string> _agentInstanceSeen = new(StringComparer.OrdinalIgnoreCase);
-        // Tracks which agents are still pending a ComputeTest result for the current run
-        private readonly Dictionary<string, string> _computeTestPending = new(StringComparer.OrdinalIgnoreCase);
-
-        // Helpers (new)
-        private Plans _plan;
-        private PowerCoordinator _power;
-
-        // ===================== Makaretu mDNS =====================
         private MulticastService? mcast;
         private ServiceDiscovery? mdns;
         private ServiceProfile? mdnsMasterProfile;
         private ServiceProfile? mdnsAgentProfile;
-        private System.Timers.Timer agentDiscoveryTimer;
-
-        // ===================== Local metrics (CPU & Memory) =====================
-        private ulong _prevIdleTicks, _prevKernelTicks, _prevUserTicks;
-        private bool _cpuInit;
-
-        // ===================== GPU metrics (v1: single GPU view) =====================
-        private List<PerformanceCounter>? _gpuCounters; // "GPU Engine" -> "Utilization Percentage"
-        private bool _gpuCountersInit;
+        private System.Timers.Timer? agentDiscoveryTimer;
 
         private string? localAgentId;
-        // SoftThreads (cache + agent queue)
-        private SoftThreadDispatcher? _softDispatcher;
-        private AgentWorkQueue? _agentWork;
-        private AgentWorkQueue? _agentWorkQueue;
+
+        // CPU meter (no P/Invoke)
+        private PerformanceCounter? _cpuTotalCounter;
+
+        // ---- SoftThreads fields are provided by MainWindow.SoftThreads.cs partial ----
+        // private SoftThreadDispatcher? _softDispatcher;
+        // private AgentWorkQueue? _agentWork;
+
+        // ---- Rolling master.log (last 100 lines) ----
+        private readonly object _fileLogLock = new();
+        private readonly Queue<string> _masterLogBuffer = new();
+        private const int MasterLogMaxLines = 100;
+        private const string MasterLogPath = "master.log";
+
+        // v1.0.1: config + HTTP registration client for the new control plane
+        private readonly NodeLinkConfig _cfg = NodeLinkConfig.Load();
+        private readonly RegistrationClient _regClient = new();
 
         public MainWindow()
         {
             InitializeComponent();
 
-            currentRole = LoadRoleFromConfig();
+            // -------- Role resolution (settings is the source of truth) --------
+            LoadSettings();  // load BEFORE deciding role
+            currentRole = (settings?.StartAsMaster == true) ? NodeRole.Master : NodeRole.Agent;
+
+            // Legacy fallback ONLY if settings.json is missing/unreadable
+            try
+            {
+                if (!System.IO.File.Exists(settingsPath))
+                    currentRole = LoadRoleFromConfig(); // reads legacy node.config
+            }
+            catch { /* ignore and keep settings-based role */ }
+
             comm = new CommChannel();
 
-            tasks = new ObservableCollection<TaskInfo>();
             TaskListBox.ItemsSource = tasks;
+            NodeGrid.ItemsSource = agentStatuses;
 
-            LoadSettings();
+            agentView = CollectionViewSource.GetDefaultView(agentStatuses);
+            if (agentView is ListCollectionView lcv) lcv.CustomSort = new AgentRowComparer();
 
-            // Join Code security – seed (Master only) and attach to comms
-            SecurityManager.EnsureJoinCode(settings, isMaster: currentRole == NodeRole.Master, log: Log);
-            SecurityManager.ApplyToComm(comm, settings);
+            LoadAgentNumberMap();
 
-            // New helpers
-            _plan = new Plans(settings, () => agentStatuses);
-            _power = new PowerCoordinator(settings, comm, () => localAgentId ?? $"Agent-{Environment.MachineName}", Log);
-            _power.WireSystemEvents(this, isAgent: currentRole != NodeRole.Master);
+            // Seed rolling file log buffer from previous run (Master only)
+            LoadExistingMasterLog();
 
             InitializeRole(currentRole);
             UpdateRoleUI();
@@ -117,39 +147,89 @@ namespace NodeLinkUI
             comm.OnMessageReceived += HandleAgentMessage;
 
             if (currentRole == NodeRole.Master)
-            {
                 SetupAgentDiscovery();
+        }
+
+        // -------- Sorting: Master first, then AgentId
+        private sealed class AgentRowComparer : System.Collections.IComparer
+        {
+            public int Compare(object? x, object? y)
+            {
+                var ax = x as AgentStatus; var ay = y as AgentStatus;
+                if (ax == null || ay == null) return 0;
+
+                bool xMaster = ax.AgentId.Equals("Master", StringComparison.OrdinalIgnoreCase);
+                bool yMaster = ay.AgentId.Equals("Master", StringComparison.OrdinalIgnoreCase);
+                if (xMaster && !yMaster) return -1;
+                if (!xMaster && yMaster) return 1;
+                return StringComparer.OrdinalIgnoreCase.Compare(ax.AgentId, ay.AgentId);
             }
         }
-        // Re-apply the current Join Code to the live comms channel when settings change.
-        public void RefreshCommunicationSecurity()
-        {
-            SecurityManager.ApplyToComm(comm, settings);
-        }
 
-        // ===================== Logging & Settings =====================
-
+        // ---------- Logging ----------
         private void Log(string message)
         {
             try
             {
                 Dispatcher.Invoke(() =>
                 {
-                    if (LogBox != null)
-                    {
-                        LogBox.Items.Add($"{DateTime.Now:T}: {message}");
-                        LogBox.ScrollIntoView(LogBox.Items[LogBox.Items.Count - 1]);
-                    }
-                    else
-                    {
-                        Console.WriteLine($"LogBox is null: {message}");
-                    }
+                    LogBox.Items.Add($"{DateTime.Now:T}: {message}");
+                    LogBox.ScrollIntoView(LogBox.Items[LogBox.Items.Count - 1]);
                 });
             }
-            catch (Exception ex)
+            catch { /* ignore UI logging errors */ }
+
+            // Also keep a rolling file log (Master only)
+            AppendMasterLog(message);
+        }
+
+        // Load existing master.log (if any) into the in-memory buffer on startup (Master only)
+        private void LoadExistingMasterLog()
+        {
+            if (currentRole != NodeRole.Master) return;
+            try
             {
-                Console.WriteLine($"Log error: {ex.Message}");
+                if (File.Exists(MasterLogPath))
+                {
+                    // Keep only the last 100 lines
+                    var lines = new Queue<string>();
+                    using var sr = new StreamReader(MasterLogPath);
+                    while (!sr.EndOfStream)
+                    {
+                        lines.Enqueue(sr.ReadLine() ?? string.Empty);
+                        while (lines.Count > MasterLogMaxLines)
+                            lines.Dequeue();
+                    }
+
+                    lock (_fileLogLock)
+                    {
+                        _masterLogBuffer.Clear();
+                        foreach (var line in lines) _masterLogBuffer.Enqueue(line);
+                    }
+                }
             }
+            catch { /* ignore file errors */ }
+        }
+
+        // Append one line into the rolling buffer and write the entire buffer to disk (Master only)
+        private void AppendMasterLog(string line)
+        {
+            if (currentRole != NodeRole.Master) return;
+
+            try
+            {
+                var stamped = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {line}";
+                lock (_fileLogLock)
+                {
+                    _masterLogBuffer.Enqueue(stamped);
+                    while (_masterLogBuffer.Count > MasterLogMaxLines)
+                        _masterLogBuffer.Dequeue();
+
+                    // Persist the rolling window
+                    File.WriteAllLines(MasterLogPath, _masterLogBuffer);
+                }
+            }
+            catch { /* ignore file errors */ }
         }
 
         private void LoadSettings()
@@ -157,85 +237,108 @@ namespace NodeLinkUI
             try
             {
                 settings = NodeLinkSettings.Load(settingsPath);
-                Log("Settings loaded successfully");
+                Log("Settings loaded.");
             }
-            catch (Exception ex)
-            {
-                Log($"Failed to load settings: {ex.Message}");
-            }
+            catch (Exception ex) { Log($"Failed to load settings: {ex.Message}"); }
         }
 
         private void SaveSettings()
         {
-            try
-            {
-                settings.Save(settingsPath);
-                Log("Settings saved.");
-            }
-            catch (Exception ex)
-            {
-                Log($"Failed to save settings: {ex.Message}");
-            }
+            try { settings.Save(settingsPath); Log("Settings saved."); }
+            catch (Exception ex) { Log($"Failed to save settings: {ex.Message}"); }
         }
 
-        // ===================== Role Init =====================
+        // Prefer settings.StartAsMaster; fallback to node.config; default Agent
+        private NodeRole LoadRoleFromConfig()
+        {
+            // Prefer settings.json if present (primary source of truth)
+            try
+            {
+                if (File.Exists(settingsPath))
+                {
+                    var s = NodeLinkSettings.Load(settingsPath);
+                    return s.StartAsMaster ? NodeRole.Master : NodeRole.Agent;
+                }
+            }
+            catch { /* fall through to legacy */ }
+
+            // Legacy fallback: node.config
+            try
+            {
+                if (File.Exists(configPath))
+                {
+                    var roleText = File.ReadAllText(configPath).Trim();
+                    if (Enum.TryParse(roleText, out NodeRole r)) return r;
+                }
+            }
+            catch { /* ignore */ }
+
+            // Safe default
+            return NodeRole.Agent;
+        }
 
         private async void InitializeRole(NodeRole role)
         {
             RoleLabel.Text = $"Current Role: {role}";
-            string localIp = GetLocalIPAddress();
 
             EnsureMdnsStarted();
+            string localIp = GetLocalIPAddress();
 
             if (role == NodeRole.Master)
             {
-                // Advertise Master via Makaretu
+                comm.InitializeAsMaster("Master");
+
                 var ip = ParseIp(localIp) ?? IPAddress.Loopback;
-                mdnsMasterProfile = new ServiceProfile(
-                    "NodeLinkMaster",
-                    ServiceTypeMaster,
-                    5000,
-                    new[] { ip }
-                );
+                mdnsMasterProfile = new ServiceProfile("NodeLinkMaster", ServiceTypeMaster, 5000, new[] { ip });
                 mdns!.Advertise(mdnsMasterProfile);
                 Log("mDNS advertised: _nodelink._tcp");
 
                 master = new NodeMaster.NodeMaster(comm);
                 masterStartTime = DateTime.Now;
 
-                scheduler = new NodeScheduler(agentStatuses);
+                scheduler = new NodeScheduler(agentStatuses.ToList());
                 scheduler.SetMode(selectedMode);
 
                 MasterStatusLabel.Text = "Online";
                 MasterStatusLabel.Foreground = Brushes.Green;
 
-                // Seed Master row once
-                agentStatuses.Add(BuildLocalStatus("Master"));
+                UpdateOrAddAgentStatus(BuildLocalStatus("Master"));
+                RefreshGridPreservingSelection();
 
-                NodeGrid.ItemsSource = null;
-                NodeGrid.ItemsSource = agentStatuses;
+                // Initialize SoftThreads on Master
                 InitializeSoftThreadsForMaster();
+
+                // Nudge agents already running
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(1000);
+                    comm.Broadcast("WhoIsAlive");
+                    Log("Broadcasted WhoIsAlive");
+                });
             }
             else
             {
-                // Advertise Agent via Makaretu
                 localAgentId = $"Agent-{Environment.MachineName}";
                 var ip = ParseIp(localIp) ?? IPAddress.Loopback;
-                mdnsAgentProfile = new ServiceProfile(
-                    $"NodeLinkAgent-{Environment.MachineName}",
-                    ServiceTypeAgent,
-                    5000,
-                    new[] { ip }
-                );
+                mdnsAgentProfile = new ServiceProfile($"NodeLinkAgent-{Environment.MachineName}", ServiceTypeAgent, 5000, new[] { ip });
                 mdns!.Advertise(mdnsAgentProfile);
                 Log("mDNS advertised: _nodelink-agent._tcp");
 
-                // Discover Master then fallback
+                // v1.0.1: Start the Agent HTTP control plane (health/register/ws stub)
+                // This makes the Agent ready for Master auto-register via HTTP.
+                AgentBootstrapper.Start(
+                    getAgentId: () => localAgentId ?? $"Agent-{Environment.MachineName}",
+                    getAgentName: () => Environment.MachineName,
+                    getLocalIp: () => GetLocalIPAddress(),
+                    log: s => Log(s)
+                );
+
+                // Discover Master
                 string masterIp = await DiscoverMasterIpAsync();
-                if (string.IsNullOrEmpty(masterIp))
+                if (string.IsNullOrWhiteSpace(masterIp))
                 {
                     masterIp = settings.MasterIp;
-                    Log($"mDNS discovery timed out, using saved IP: {masterIp}");
+                    Log($"Discovery timed out; using saved Master IP: {masterIp}");
                 }
                 else
                 {
@@ -244,45 +347,38 @@ namespace NodeLinkUI
                     Log($"Discovered Master IP: {masterIp}");
                 }
 
-                scheduler = null;
+                comm.InitializeAsAgent(localAgentId, masterIp);
+                comm.SetMasterIp(masterIp);
 
-                agent = new NodeAgent.NodeAgent(localAgentId, comm);
+                UpdateOrAddAgentStatus(BuildLocalStatus(localAgentId));
+                RefreshGridPreservingSelection();
 
-                // Add Agent to grid using local metrics
-                agentStatuses.Add(BuildLocalStatus(localAgentId));
-
-                NodeGrid.ItemsSource = null;
-                NodeGrid.ItemsSource = agentStatuses;
+                // Initialize SoftThreads on Agent
                 InitializeSoftThreadsForAgent();
 
-                // Apply (Pro-only) power startup policy
-                _power.ApplyStartupPolicy(isAgent: true);
+                // Announce presence (config + pulse)
+                var cfg = BuildAgentConfig(localAgentId);
+                comm.SendToMaster($"AgentConfig:{JsonSerializer.Serialize(cfg)}");
+                var pulse = BuildAgentPulse(localAgentId);
+                comm.SendToMaster($"AgentPulse:{JsonSerializer.Serialize(pulse)}");
             }
         }
 
-        private IPAddress? ParseIp(string ip)
-        {
-            if (IPAddress.TryParse(ip, out var addr)) return addr;
-            return null;
-        }
+
+        private IPAddress? ParseIp(string ip) => IPAddress.TryParse(ip, out var a) ? a : null;
 
         private string GetLocalIPAddress()
         {
             foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
             {
-                if (ni.OperationalStatus == OperationalStatus.Up &&
-                    ni.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
-                    !ni.Description.ToLower().Contains("virtual") &&
-                    !ni.Name.ToLower().Contains("virtual"))
-                {
-                    foreach (var ip in ni.GetIPProperties().UnicastAddresses)
-                    {
-                        if (ip.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-                        {
-                            return ip.Address.ToString();
-                        }
-                    }
-                }
+                if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                if (ni.Description.Contains("virtual", StringComparison.OrdinalIgnoreCase)) continue;
+                if (ni.Name.Contains("virtual", StringComparison.OrdinalIgnoreCase)) continue;
+
+                foreach (var ip in ni.GetIPProperties().UnicastAddresses)
+                    if (ip.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                        return ip.Address.ToString();
             }
             return "127.0.0.1";
         }
@@ -290,375 +386,308 @@ namespace NodeLinkUI
         private void UpdateRoleUI()
         {
             bool masterOnline = currentRole == NodeRole.Master || IsMasterOnline(settings.MasterIp);
-            Dispatcher.Invoke(() =>
-            {
-                RegisterAgentButton.IsEnabled = currentRole == NodeRole.Master;
-                DispatchTaskButton.IsEnabled = currentRole == NodeRole.Master;
-                BroadcastButton.IsEnabled = currentRole == NodeRole.Master;
-                StopAllTasksButton.IsEnabled = currentRole == NodeRole.Master;
+            RegisterAgentButton.IsEnabled = currentRole == NodeRole.Master;
+            DispatchTaskButton.IsEnabled = currentRole == NodeRole.Master;
+            BroadcastButton.IsEnabled = currentRole == NodeRole.Master;
+            StopAllTasksButton.IsEnabled = currentRole == NodeRole.Master;
+            TaskInputBox.IsEnabled = currentRole == NodeRole.Master;
+            CustomTaskButton.IsEnabled = currentRole == NodeRole.Master;
 
-                // Custom task controls exist but may be hidden; safe to set
-                TaskInputBox.IsEnabled = currentRole == NodeRole.Master;
-                CustomTaskButton.IsEnabled = currentRole == NodeRole.Master;
-
-                NodeGrid.ItemsSource = agentStatuses;
-                TaskCountLabel.Text = tasks.Count.ToString();
-            });
+            TaskCountLabel.Text = tasks.Count.ToString();
 
             if (masterOnline && currentRole != NodeRole.Master)
             {
                 MasterStatusLabel.Text = "Online";
                 MasterStatusLabel.Foreground = Brushes.Green;
-                Log("Master is online.");
             }
             else if (currentRole != NodeRole.Master)
             {
                 MasterStatusLabel.Text = "Offline";
                 MasterStatusLabel.Foreground = Brushes.Red;
-                Log("Master not detected.");
+            }
+        }
+
+        public void RestartIntoRole(NodeRole role)
+        {
+            try
+            {
+                // Persist the desired role to settings (source of truth for next launch)
+                settings.StartAsMaster = (role == NodeRole.Master);
+                try { SaveSettings(); } catch { /* ignore */ }
+
+                // Optional: keep legacy node.config in sync
+                try { System.IO.File.WriteAllText("node.config", role.ToString()); } catch { /* ignore */ }
+
+                // Clean down any background services
+                try { DisposeSoftThreads(); } catch { /* ignore */ }
+                try { StopMdns(); } catch { /* ignore */ }
+
+                // Relaunch the current executable
+                var exePath = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName ?? string.Empty;
+                if (!string.IsNullOrWhiteSpace(exePath))
+                {
+                    System.Diagnostics.Process.Start(exePath);
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"Failed to restart: {ex.Message}", "Restart Error",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            finally
+            {
+                Application.Current.Shutdown();
             }
         }
 
         private bool IsMasterOnline(string ip)
         {
             if (string.IsNullOrWhiteSpace(ip) || ip == "Unknown") return false;
-            try
-            {
-                using var ping = new Ping();
-                return ping.Send(ip, 1000).Status == IPStatus.Success;
-            }
-            catch
-            {
-                return false;
-            }
+            try { using var ping = new Ping(); return ping.Send(ip, 1000).Status == IPStatus.Success; }
+            catch { return false; }
         }
 
-        private NodeRole LoadRoleFromConfig()
-        {
-            if (!File.Exists(configPath)) return NodeRole.Agent;
-            var roleText = File.ReadAllText(configPath).Trim();
-            return Enum.TryParse(roleText, out NodeRole role) ? role : NodeRole.Agent;
-        }
-
-        private void SaveRoleToConfig(NodeRole role)
-        {
-            File.WriteAllText(configPath, role.ToString());
-        }
-
-        // ===================== Buttons & UI =====================
-
-        private void SwitchRole_Click(object sender, RoutedEventArgs e)
-        {
-            var newRole = currentRole == NodeRole.Master ? NodeRole.Agent : NodeRole.Master;
-            var result = MessageBox.Show(
-                $"Switch to {newRole} and restart the app?",
-                "Confirm Role Switch",
-                MessageBoxButton.YesNo,
-                MessageBoxImage.Question);
-
-            if (result == MessageBoxResult.Yes)
-            {
-                SaveRoleToConfig(newRole);
-                Log($"Switched to {newRole}");
-                RestartApp(newRole);
-            }
-            else
-            {
-                Log("Role switch cancelled.");
-            }
-        }
-
-        private void RestartApp(NodeRole newRole)
+        private void LoadAgentNumberMap()
         {
             try
             {
-                DisposeSoftThreads();
-                StopMdns();
-
-                if (agentDiscoveryTimer != null)
+                if (File.Exists(AgentNumberMapPath))
                 {
-                    agentDiscoveryTimer.Stop();
-                    agentDiscoveryTimer.Dispose();
-                }
-
-                File.AppendAllText("restart.log", $"Restart triggered at {DateTime.Now:yyyy-MM-dd HH:mm:ss} for role: {newRole}\n");
-                string exePath = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName;
-                if (!string.IsNullOrEmpty(exePath))
-                {
-                    System.Diagnostics.Process.Start(exePath);
-                }
-                else
-                {
-                    Log("Failed to locate executable path for restart.");
+                    var json = File.ReadAllText(AgentNumberMapPath);
+                    var map = JsonSerializer.Deserialize<Dictionary<string, int>>(json);
+                    if (map != null) _agentNumberMap = new Dictionary<string, int>(map, StringComparer.OrdinalIgnoreCase);
                 }
             }
-            catch (Exception ex)
-            {
-                Log($"Failed to restart app: {ex.Message}");
-            }
-            Application.Current.Shutdown();
+            catch { }
         }
 
-        private void ExitButton_Click(object sender, RoutedEventArgs e)
+        private void SaveAgentNumberMap()
         {
             try
             {
-                DisposeSoftThreads();
-                StopMdns();
-
-                if (agentDiscoveryTimer != null)
-                {
-                    agentDiscoveryTimer.Stop();
-                    agentDiscoveryTimer.Dispose();
-                }
-
-                SaveSettings();
-                File.AppendAllText("restart.log", $"App exited at {DateTime.Now:yyyy-MM-dd HH:mm:ss}\n");
-                Application.Current.Shutdown();
+                var json = JsonSerializer.Serialize(_agentNumberMap, new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(AgentNumberMapPath, json);
             }
-            catch (Exception ex)
-            {
-                Log($"Failed to exit cleanly: {ex.Message}");
-            }
+            catch { }
         }
 
-        private void SettingsButton_Click(object sender, RoutedEventArgs e)
+        private int GetOrAssignAgentNumber(string agentId)
         {
-            var settingsWindow = new SettingsWindow(settings, agentStatuses, IsProVersion);
-            settingsWindow.Owner = this;
-            settingsWindow.ShowDialog();
-            ApplySettings();
+            if (string.IsNullOrWhiteSpace(agentId)) return 0;
+            if (_agentNumberMap.TryGetValue(agentId, out var n)) return n;
+            int next = _agentNumberMap.Count == 0 ? 1 : Math.Max(1, _agentNumberMap.Values.Max() + 1);
+            _agentNumberMap[agentId] = next;
+            SaveAgentNumberMap();
+            return next;
         }
 
-        private void SchedulerModeDropdown_Changed(object sender, SelectionChangedEventArgs e)
-        {
-            if (sender is ComboBox cb && cb.SelectedItem is ComboBoxItem item)
-            {
-                var modeText = item.Content?.ToString();
-                if (Enum.TryParse(modeText, out SchedulerMode mode))
-                {
-                    selectedMode = mode;
-                    if (currentRole == NodeRole.Master && scheduler != null)
-                    {
-                        scheduler.SetMode(mode);
-                        Log($"Scheduler mode set to: {mode}");
-                    }
-                }
-                else
-                {
-                    Log($"Invalid scheduler mode: {modeText}");
-                }
-            }
-        }
-        // --- Add inside the MainWindow class (anywhere among your other event handlers) ---
-        #region Help / About menu
-
-        private void HelpMenu_Click(object sender, RoutedEventArgs e)
-        {
-            // Try local help first
-            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            string[] candidates =
-            {
-        Path.Combine(baseDir, "help", "index.html"),
-        Path.Combine(baseDir, "help", "help.html"),
-        Path.Combine(baseDir, "help.pdf"),
-    };
-
-            foreach (var path in candidates)
-            {
-                if (File.Exists(path))
-                {
-                    TryShellOpen(path);
-                    return;
-                }
-            }
-
-            // Fallback to the project README (adjust to your docs URL if needed)
-            TryShellOpen("https://github.com/DunMath/NodeLinkUI#readme");
-        }
-
-        private void AboutMenu_Click(object sender, RoutedEventArgs e)
-        {
-            var asm = Assembly.GetEntryAssembly() ?? Assembly.GetExecutingAssembly();
-            var name = asm.GetName();
-            var ver = name.Version?.ToString() ?? "0.0.0.0";
-            var infoVer = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
-            if (!string.IsNullOrWhiteSpace(infoVer))
-                ver = infoVer;
-
-            string roleText = currentRole.ToString();
-            string plan = (settings?.ProMode == true) ? "Pro" : "Free";
-            string build = Environment.Is64BitProcess ? "x64" : "x86";
-
-            string msg =
-                "SoftThreader / NodeLinkUI\n" +
-                $"Version: {ver}\n" +
-                $"Role: {roleText}   Plan: {plan}\n" +
-                $"Machine: {Environment.MachineName}\n" +
-                $".NET: {Environment.Version}   {build}\n\n" +
-                $"© {DateTime.Now:yyyy} DunMath. All rights reserved.";
-
-            MessageBox.Show(this, msg, "About", MessageBoxButton.OK, MessageBoxImage.Information);
-        }
-
-        private static void TryShellOpen(string target)
-        {
-            try
-            {
-                Process.Start(new ProcessStartInfo
-                {
-                    FileName = target,
-                    UseShellExecute = true
-                });
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"Failed to open:\n{target}\n\n{ex.Message}",
-                    "Open failed", MessageBoxButton.OK, MessageBoxImage.Warning);
-            }
-        }
-
-        #endregion
-
-        // ===================== Messaging & Tasks =====================
-
+        // ===================== Messaging =====================
         private void HandleAgentMessage(string agentId, string message)
         {
             Log($"Message from {agentId}: {message}");
 
-            // ===================== Agent-side fast paths =====================
-            // Let PowerCoordinator consume Pro-only messages first (existing behavior)
-            if (currentRole != NodeRole.Master && _power.TryHandleMessage(message, isAgent: true))
-                return;
+            // Presence stamp
+            if (!string.IsNullOrWhiteSpace(agentId) && !agentId.Equals("Master", StringComparison.OrdinalIgnoreCase))
+                _lastSeenUtc[agentId] = DateTime.UtcNow;
 
-            // ComputeTest: exercise the real dispatch/return path (Agent replies to Master)
-            if (currentRole == NodeRole.Agent && message.StartsWith("ComputeTest:", StringComparison.OrdinalIgnoreCase))
+            // Agent-side responses
+            if (currentRole == NodeRole.Agent)
             {
-                var testId = message.Substring("ComputeTest:".Length).Trim();
-                var thisId = localAgentId ?? $"Agent-{Environment.MachineName}";
-                try
+                if (string.Equals(message, "RequestConfig", StringComparison.OrdinalIgnoreCase))
                 {
-                    // Do a tiny bit of work so it's not just an echo
-                    long acc = 0;
-                    for (int i = 1; i <= 50; i++) acc += i;
-
-                    comm.SendToMaster($"ComputeTestResult:{thisId}:{testId}:OK");
+                    var id = localAgentId ?? $"Agent-{Environment.MachineName}";
+                    var cfg = BuildAgentConfig(id);
+                    comm.SendToMaster($"AgentConfig:{JsonSerializer.Serialize(cfg)}");
+                    return;
                 }
-                catch
+
+                if (string.Equals(message, "WhoIsAlive", StringComparison.OrdinalIgnoreCase))
                 {
-                    comm.SendToMaster($"ComputeTestResult:{thisId}:{testId}:FAIL");
+                    var id = localAgentId ?? $"Agent-{Environment.MachineName}";
+                    var cfg = BuildAgentConfig(id);
+                    comm.SendToMaster($"AgentConfig:{JsonSerializer.Serialize(cfg)}");
+                    var pulse = BuildAgentPulse(id);
+                    comm.SendToMaster($"AgentPulse:{JsonSerializer.Serialize(pulse)}");
+                    return;
+                }
+
+                if (message.StartsWith("Compute:", StringComparison.OrdinalIgnoreCase) ||
+                    message.StartsWith("CustomTask:", StringComparison.OrdinalIgnoreCase))
+                {
+                    _agentWork?.Enqueue(message);
+                    Log($"Queued work on Agent: {message}");
+                    return;
+                }
+            }
+
+            // Master: RegisterAck
+            if (currentRole == NodeRole.Master && message.StartsWith("RegisterAck:", StringComparison.OrdinalIgnoreCase))
+            {
+                var first = message.IndexOf(':');
+                var second = first >= 0 ? message.IndexOf(':', first + 1) : -1;
+                if (first >= 0 && second > first)
+                {
+                    var ackAgentId = message.Substring(first + 1, second - first - 1).Trim();
+                    var agentNumber = GetOrAssignAgentNumber(ackAgentId);
+
+                    var row = agentStatuses.FirstOrDefault(a => a.AgentId.Equals(ackAgentId, StringComparison.OrdinalIgnoreCase));
+                    if (row == null)
+                    {
+                        row = new AgentStatus { AgentId = ackAgentId, IsOnline = true, LastHeartbeat = DateTime.Now };
+                        agentStatuses.Add(row);
+                    }
+                    else
+                    {
+                        row.IsOnline = true;
+                        row.LastHeartbeat = DateTime.Now;
+                    }
+                    Log($"RegisterAck accepted from {ackAgentId} (Agent #{agentNumber})");
+                    RefreshGridPreservingSelection();
                 }
                 return;
             }
 
-            // Agent: buffer incoming compute/custom work so the UI thread isn't blocked
-            if (currentRole == NodeRole.Agent &&
-                (message.StartsWith("Compute:", StringComparison.OrdinalIgnoreCase) ||
-                 message.StartsWith("CustomTask:", StringComparison.OrdinalIgnoreCase)))
-            {
-                _agentWork?.Enqueue(message);
-                return;
-            }
-
-            // ===================== Master-side: structured messages =====================
-
-            // Master receives: ComputeTestResult:{agentId}:{testId}:{OK|FAIL}
+            // Master: ComputeTestResult (supports ✓/✗ or OK/FAIL formats)
             if (currentRole == NodeRole.Master && message.StartsWith("ComputeTestResult:", StringComparison.OrdinalIgnoreCase))
             {
-                var parts = message.Split(':');
-                if (parts.Length >= 4)
+                try
                 {
-                    var agent = parts[1];
-                    var testId = parts[2];
-                    var outcome = parts[3];
+                    // Formats supported:
+                    // 1) ComputeTestResult:{agentId}:{✓|✗}
+                    // 2) ComputeTestResult:{agentId}:{testId}:{OK|FAIL}
+                    var parts = message.Split(':');
+                    var aId = parts.Length > 1 ? parts[1].Trim() : agentId;
+                    string symbol = "✓";
 
-                    var status = agentStatuses.FirstOrDefault(s => s.AgentId.Equals(agent, StringComparison.OrdinalIgnoreCase));
-                    if (status != null)
+                    if (parts.Length == 3)
                     {
-                        bool accept;
-                        lock (_computeTestPending)
-                        {
-                            accept = _computeTestPending.TryGetValue(agent, out var pending) && pending == testId;
-                            if (accept) _computeTestPending.Remove(agent);
-                        }
-
-                        // Only update if this result matches the current run
-                        if (accept)
-                        {
-                            status.SelfTestStatus = outcome.Equals("OK", StringComparison.OrdinalIgnoreCase) ? "✓" : "✗";
-
-                            Dispatcher.Invoke(() =>
-                            {
-                                NodeGrid.ItemsSource = null;
-                                NodeGrid.ItemsSource = agentStatuses;
-                            });
-                        }
+                        var tok = parts[2].Trim();
+                        symbol = (tok.Equals("✓") || tok.Equals("OK", StringComparison.OrdinalIgnoreCase)) ? "✓" : "✗";
                     }
+                    else if (parts.Length >= 4)
+                    {
+                        var tok = parts[3].Trim();
+                        symbol = tok.Equals("OK", StringComparison.OrdinalIgnoreCase) ? "✓" : "✗";
+                    }
+
+                    var row = agentStatuses.FirstOrDefault(a => a.AgentId.Equals(aId, StringComparison.OrdinalIgnoreCase));
+                    if (row != null)
+                    {
+                        row.SelfTestStatus = symbol;
+                        row.IsOnline = true;
+                        row.LastHeartbeat = DateTime.Now;
+                        UpdateOrAddAgentStatus(row);
+                        RefreshGridPreservingSelection();
+                    }
+
+                    _softDispatcher?.OnResultReceived(aId); // decrement in-flight if used
+                    UpdateSoftThreadStats();
+
+                    Log($"Self-test result from {aId}: {symbol}");
+                }
+                catch (Exception ex)
+                {
+                    Log($"ComputeTestResult parse error: {ex.Message}");
                 }
                 return;
             }
 
-            // Master/Agent: status updates
+            // Master: static config (stable fields only)
+            if (currentRole == NodeRole.Master && message.StartsWith("AgentConfig:", StringComparison.OrdinalIgnoreCase))
+            {
+                var json = message.Substring("AgentConfig:".Length);
+                try
+                {
+                    var cfg = JsonSerializer.Deserialize<NodeCore.AgentConfig>(json);
+                    if (cfg != null)
+                    {
+                        var row = agentStatuses.FirstOrDefault(a => a.AgentId.Equals(cfg.AgentId, StringComparison.OrdinalIgnoreCase))
+                                  ?? new AgentStatus { AgentId = cfg.AgentId };
+
+                        // Stable fields ONLY from AgentConfig
+                        row.CpuLogicalCores = cfg.CpuLogicalCores;
+                        row.HasGpu = cfg.HasGpu;
+                        row.GpuModel = cfg.GpuModel ?? "";
+                        row.GpuMemoryMB = cfg.GpuMemoryMB;
+                        row.GpuCount = cfg.GpuCount;
+                        row.InstanceId = cfg.InstanceId ?? "";
+                        row.IsOnline = true;
+                        row.LastHeartbeat = DateTime.Now;
+
+                        UpdateOrAddAgentStatus(row);
+                        RefreshGridPreservingSelection();
+                        Log($"Config updated for {cfg.AgentId}");
+                    }
+                }
+                catch (Exception ex) { Log($"Failed to parse AgentConfig: {ex.Message}"); }
+                return;
+            }
+
+            // Everyone: volatile pulse (no zero flicker)
+            if (message.StartsWith("AgentPulse:", StringComparison.OrdinalIgnoreCase))
+            {
+                var json = message.Substring("AgentPulse:".Length);
+                try
+                {
+                    var p = JsonSerializer.Deserialize<NodeCore.AgentPulse>(json);
+                    if (p != null)
+                    {
+                        _lastSeenUtc[p.AgentId] = DateTime.UtcNow;
+
+                        var row = agentStatuses.FirstOrDefault(a => a.AgentId.Equals(p.AgentId, StringComparison.OrdinalIgnoreCase))
+                                  ?? new AgentStatus { AgentId = p.AgentId };
+
+                        float ApplyDelta(float current, float incoming, float minDelta = 1.5f)
+                        {
+                            if (float.IsNaN(incoming)) return current;
+                            if (Math.Abs(current - incoming) < minDelta) return current;
+                            return incoming;
+                        }
+
+                        row.CpuUsagePercent = ApplyDelta(row.CpuUsagePercent, p.CpuUsagePercent);
+                        if (p.MemoryAvailableMB > 0) row.MemoryAvailableMB = p.MemoryAvailableMB;
+                        row.GpuUsagePercent = row.HasGpu ? ApplyDelta(row.GpuUsagePercent, p.GpuUsagePercent) : 0f;
+                        row.TaskQueueLength = p.TaskQueueLength;
+                        row.NetworkMbps = p.NetworkMbps;
+                        row.DiskReadMBps = p.DiskReadMBps;
+                        row.DiskWriteMBps = p.DiskWriteMBps;
+                        row.LastHeartbeat = p.LastHeartbeat == default ? DateTime.Now : p.LastHeartbeat;
+                        row.IsOnline = true;
+
+                        UpdateOrAddAgentStatus(row);
+                        RefreshGridPreservingSelection();
+                        UpdateSoftThreadStats();
+                    }
+                }
+                catch (Exception ex) { Log($"Failed to parse AgentPulse: {ex.Message}"); }
+                return;
+            }
+
+            // Legacy AgentStatus (kept)
             if (message.StartsWith("AgentStatus:", StringComparison.OrdinalIgnoreCase))
             {
                 var json = message.Substring("AgentStatus:".Length);
                 try
                 {
                     var status = AgentStatus.FromJson(json);
-
-                    // Pro upsell trigger on Master: on each Agent restart if that Agent has >1 GPU
-                    if (currentRole == NodeRole.Master && status != null && status.GpuCount > 1)
+                    if (status != null)
                     {
-                        var seen = _agentInstanceSeen.TryGetValue(status.AgentId, out var lastId) ? lastId : null;
-                        if (string.IsNullOrEmpty(seen) || !string.Equals(seen, status.InstanceId ?? "", StringComparison.OrdinalIgnoreCase))
-                        {
-                            _agentInstanceSeen[status.AgentId] = status.InstanceId ?? "";
-                            Dispatcher.Invoke(() =>
-                            {
-                                AlertBox.Items.Add($"Multiple GPUs detected on {status.AgentId}. Upgrade to Pro Version.");
-                            });
-                        }
-                        else
-                        {
-                            _agentInstanceSeen[status.AgentId] = status.InstanceId ?? "";
-                        }
+                        _lastSeenUtc[status.AgentId] = DateTime.UtcNow;
+                        UpdateOrAddAgentStatus(status);
+                        RefreshGridPreservingSelection();
+                        Log($"Updated status for {status.AgentId}");
                     }
-
-                    // Track first-seen order (Master only)
-                    if (currentRole == NodeRole.Master && status != null)
-                        _plan.TouchFirstSeen(status.AgentId);
-
-                    var existing = agentStatuses.FirstOrDefault(a => a.AgentId == status.AgentId);
-                    if (existing != null) agentStatuses.Remove(existing);
-                    agentStatuses.Add(status);
-
-                    Dispatcher.Invoke(() =>
-                    {
-                        NodeGrid.ItemsSource = null;
-                        NodeGrid.ItemsSource = agentStatuses;
-                        if (currentRole == NodeRole.Agent && agentStatuses.Any(s => s.AgentId == "Master"))
-                        {
-                            MasterStatusLabel.Text = "Online";
-                            MasterStatusLabel.Foreground = Brushes.Green;
-                        }
-                    });
-
-                    // Keep SoftThreads summary in sync on Master
-                    if (currentRole == NodeRole.Master)
-                        UpdateSoftThreadStats();
-
-                    Log($"Updated status for {status.AgentId}");
                 }
-                catch (Exception ex)
-                {
-                    Log($"Failed to parse AgentStatus: {ex.Message}");
-                }
+                catch (Exception ex) { Log($"Failed to parse AgentStatus: {ex.Message}"); }
                 return;
             }
 
-            // Master/Agent: compute result stream (existing)
+            // ComputeResult collation (and in-flight decrement)
             if (message.StartsWith("ComputeResult:", StringComparison.OrdinalIgnoreCase))
             {
+                _softDispatcher?.OnResultReceived(agentId);
+                UpdateSoftThreadStats();
+
                 var parts = message.Split(':');
                 if (parts.Length > 2)
                 {
@@ -674,545 +703,440 @@ namespace NodeLinkUI
                         ReassembleComputeResults(appName);
                     }
                 }
-
-                // Tell the dispatcher one unit completed (for pacing) and refresh stats
-                _softDispatcher?.OnResultReceived(agentId);
-                UpdateSoftThreadStats();
                 return;
             }
 
-            // Master/Agent: ad-hoc custom task bookkeeping (existing)
-            if (message.StartsWith("CustomTask:", StringComparison.OrdinalIgnoreCase))
+            // Task list updates (kept simple)
+            if (message.StartsWith("Result:", StringComparison.OrdinalIgnoreCase))
             {
-                var parts = message.Split(':');
-                if (parts.Length > 2)
+                if (currentRole == NodeRole.Master)
                 {
-                    var taskId = parts[1];
-                    var description = string.Join(":", parts, 2, parts.Length - 2);
-
-                    // Only allow tasks to in-plan agents (Master side only generates these, but keep safe)
-                    if (currentRole == NodeRole.Master && !_plan.IsWithinPlan(agentId))
-                    {
-                        Log($"Custom task ignored for {agentId} (over free plan limit).");
-                        Dispatcher.Invoke(() => AlertBox.Items.Add($"{agentId} is over the Free plan limit and won’t receive tasks. Upgrade to Pro."));
-                        return;
-                    }
-
-                    Dispatcher.Invoke(() =>
-                    {
-                        tasks.Add(new TaskInfo
-                        {
-                            TaskId = taskId,
-                            Description = description,
-                            AgentId = agentId,
-                            Timestamp = DateTime.Now
-                        });
-                        taskHistory.Add($"{DateTime.Now:T}: {description} on {agentId}");
-                        TaskCountLabel.Text = tasks.Count.ToString();
-                    });
-                    Log($"Received custom task: {description} for Agent: {agentId}");
+                    _softDispatcher?.OnResultReceived(agentId);
+                    UpdateSoftThreadStats();
                 }
-                return;
-            }
-
-            // Master/Agent: stop single task (existing)
-            if (message.StartsWith("StopTask:", StringComparison.OrdinalIgnoreCase))
-            {
-                var parts = message.Split(':');
-                if (parts.Length > 1)
-                {
-                    var taskId = parts[1];
-                    Dispatcher.Invoke(() =>
-                    {
-                        var task = tasks.FirstOrDefault(t => t.TaskId == taskId && t.AgentId == agentId);
-                        if (task != null)
-                        {
-                            tasks.Remove(task);
-                            taskHistory.Add($"{DateTime.Now:T}: Stopped task {taskId} on {agentId}");
-                            TaskCountLabel.Text = tasks.Count.ToString();
-                        }
-                    });
-                    Log($"Stopped task {taskId} on Agent: {agentId}");
-                }
-                return;
-            }
-
-            // Master/Agent: stop all (existing)
-            if (string.Equals(message, "StopAllTasks", StringComparison.OrdinalIgnoreCase))
-            {
-                Dispatcher.Invoke(() =>
-                {
-                    tasks.Clear();
-                    taskHistory.Add($"{DateTime.Now:T}: Stopped all tasks");
-                    TaskCountLabel.Text = "0";
-                });
-                Log("Stopped all tasks");
-                return;
-            }
-
-            // Master/Agent: miscellaneous launch/error results (existing)
-            if (message.StartsWith("Result:", StringComparison.OrdinalIgnoreCase) ||
-                message.StartsWith("Launched:", StringComparison.OrdinalIgnoreCase) ||
-                message.StartsWith("Launch failed:", StringComparison.OrdinalIgnoreCase))
-            {
                 Log($"Task response: {message}");
                 taskHistory.Add($"{DateTime.Now:T}: {message}");
-
-                // Generic completion feedback for the dispatcher pacing
-                _softDispatcher?.OnResultReceived(agentId);
-                UpdateSoftThreadStats();
                 return;
             }
         }
-
-
-
-        private void Broadcast_Click(object sender, RoutedEventArgs e)
-        {
-            string message = $"Ping-{DateTime.Now.Ticks}";
-            comm.Broadcast(message);
-            Log($"Broadcasted: {message}");
-        }
-
-        private void CustomTaskButton_Click(object sender, RoutedEventArgs e)
-        {
-            if (currentRole == NodeRole.Master)
-            {
-                string task = TaskInputBox.Text;
-                if (!string.IsNullOrEmpty(task))
-                {
-                    var agent = agentStatuses
-                        .FirstOrDefault(a => a.IsOnline && a.AgentId != "Master" && _plan.IsWithinPlan(a.AgentId));
-
-                    if (agent != null)
-                    {
-                        string taskId = Guid.NewGuid().ToString();
-                        master?.DispatchTaskToAgent($"CustomTask:{taskId}:{task}", agent.AgentId);
-                        Log($"Sent custom task: {task} to Agent: {agent.AgentId}");
-                        taskHistory.Add($"{DateTime.Now:T}: Sent {task} to {agent.AgentId}");
-                        tasks.Add(new TaskInfo
-                        {
-                            TaskId = taskId,
-                            Description = task,
-                            AgentId = agent.AgentId,
-                            Timestamp = DateTime.Now
-                        });
-                        TaskCountLabel.Text = tasks.Count.ToString();
-                    }
-                    else
-                    {
-                        Log("No eligible agents (within plan) to assign task");
-                        Dispatcher.Invoke(() => AlertBox.Items.Add("No eligible agents within Free plan. Upgrade to Pro for more."));
-                    }
-                }
-                else
-                {
-                    Log("No custom task entered");
-                }
-            }
-            else
-            {
-                Log("Custom tasks can only be sent in Master mode");
-            }
-        }
-
-        private void StopTaskMenuItem_Click(object sender, RoutedEventArgs e)
-        {
-            if (currentRole == NodeRole.Master)
-            {
-                var selectedTask = TaskListBox.SelectedItem as TaskInfo;
-                if (selectedTask != null)
-                {
-                    master?.DispatchTaskToAgent($"StopTask:{selectedTask.TaskId}", selectedTask.AgentId);
-                    Log($"Requested to stop task {selectedTask.TaskId} on Agent: {selectedTask.AgentId}");
-                    taskHistory.Add($"{DateTime.Now:T}: Requested to stop task {selectedTask.TaskId} on {selectedTask.AgentId}");
-                }
-                else
-                {
-                    Log("No task selected");
-                }
-            }
-            else
-            {
-                Log("Tasks can only be stopped in Master mode");
-            }
-        }
-
-        private void StopAllTasksButton_Click(object sender, RoutedEventArgs e)
-        {
-            if (currentRole != NodeRole.Master) { Log("Tasks can only be stopped in Master mode"); return; }
-
-            // Only send to agents within plan (out-of-plan agents shouldn’t be running tasks, but safe anyway)
-            var targetAgents = agentStatuses.Where(a => a.AgentId != "Master" && a.IsOnline && _plan.IsWithinPlan(a.AgentId)).Select(a => a.AgentId).ToList();
-            if (targetAgents.Count == 0)
-            {
-                Log("No eligible agents within plan to stop tasks.");
-                return;
-            }
-
-            foreach (var id in targetAgents)
-                master?.DispatchTaskToAgent("StopAllTasks", id);
-
-            Log("Requested to stop all tasks on eligible agents");
-            taskHistory.Add($"{DateTime.Now:T}: Requested to stop all tasks (eligible agents only)");
-        }
-
-        private void RegisterAgent_Click(object sender, RoutedEventArgs e)
-        {
-            if (currentRole != NodeRole.Master || master is null) return;
-
-            var agentId = $"Agent-{++agentCount}";
-            master.RegisterAgent(agentId, message => HandleAgentMessage(agentId, message));
-
-            var status = BuildLocalStatus(agentId);
-
-            agentStatuses.Add(status);
-            _plan.TouchFirstSeen(agentId);
-
-            Dispatcher.Invoke(() =>
-            {
-                NodeGrid.ItemsSource = null;
-                NodeGrid.ItemsSource = agentStatuses;
-            });
-            Log($"Registered {agentId}");
-        }
-
-        private void DispatchTask_Click(object sender, RoutedEventArgs e)
-        {
-            if (currentRole != NodeRole.Master || master is null) return;
-
-            if (settings.NominatedApps.Count == 0)
-            {
-                Log("No nominated apps available for dispatch.");
-                return;
-            }
-
-            foreach (var app in settings.NominatedApps)
-            {
-                DispatchComputeTasksForApp(app);
-            }
-        }
-        private async void ComputeTest_Click(object sender, RoutedEventArgs e)
-        {
-            if (currentRole != NodeRole.Master)
-            {
-                Log("Compute Test is only available in Master mode.");
-                return;
-            }
-
-            // Snapshot the agents (skip the Master row)
-            var targets = agentStatuses
-                .Where(a => a != null && a.IsOnline && !string.Equals(a.AgentId, "Master", StringComparison.OrdinalIgnoreCase))
-                .ToList();
-
-            if (targets.Count == 0)
-            {
-                Log("No online agents to test.");
-                return;
-            }
-
-            // One run id for all agents this click; results carry back (agentId + testId)
-            var runId = Guid.NewGuid().ToString("N");
-
-            // Mark pending + fire the test to each agent
-            foreach (var a in targets)
-            {
-                a.SelfTestStatus = "…";
-                lock (_computeTestPending)
-                    _computeTestPending[a.AgentId] = runId;
-
-                // Send through the real compute pipe
-                if (master != null)
-                    master.DispatchTaskToAgent($"ComputeTest:{runId}", a.AgentId);
-                else
-                    comm.SendToAgent(a.AgentId, $"ComputeTest:{runId}");
-            }
-
-            // Refresh UI to show pending
-            Dispatcher.Invoke(() =>
-            {
-                NodeGrid.ItemsSource = null;
-                NodeGrid.ItemsSource = agentStatuses;
-            });
-
-            // Timeout: any agent that hasn't replied in time is marked as fail
-            await Task.Delay(3000); // 3s window for replies
-
-            foreach (var a in targets)
-            {
-                bool stillPending;
-                lock (_computeTestPending)
-                {
-                    stillPending = _computeTestPending.TryGetValue(a.AgentId, out var id) && id == runId;
-                    if (stillPending) _computeTestPending.Remove(a.AgentId);
-                }
-                if (stillPending)
-                    a.SelfTestStatus = "✗";
-            }
-
-            // Final UI refresh
-            Dispatcher.Invoke(() =>
-            {
-                NodeGrid.ItemsSource = null;
-                NodeGrid.ItemsSource = agentStatuses;
-            });
-        }
-
-        private void DispatchComputeTasksForApp(NominatedApp app)
-        {
-            bool preferGpu = settings.UseGpuGlobally;
-
-            var eligibleAgents = agentStatuses
-                .Where(a => a.IsOnline && a.AgentId != "Master" && (!preferGpu || a.HasGpu))
-                .Where(a => _plan.IsWithinPlan(a.AgentId)) // enforce Free plan cap
-                .ToList();
-
-            if (!eligibleAgents.Any())
-            {
-                Log($"No suitable agents available for {app.Name} (Free plan cap or GPU requirement).");
-                Dispatcher.Invoke(() => AlertBox.Items.Add($"No eligible agents (within Free plan) for {app.Name}. Upgrade to Pro for more parallelism."));
-                return;
-            }
-
-            for (int i = 0; i < 10; i++)
-            {
-                scheduler = new NodeScheduler(eligibleAgents);
-                scheduler.SetMode(selectedMode);
-
-                string taskId = $"task_{taskSequenceId}";
-                string taskPayload = $"Compute:{app.Name}|{taskSequenceId}|task_{i}";
-                string selectedAgentId = scheduler.SelectAgent(taskPayload, null);
-
-                if (string.IsNullOrEmpty(selectedAgentId) || selectedAgentId == "None")
-                {
-                    Log($"No suitable agents for compute task {app.Name} (task {i})");
-                    continue;
-                }
-
-                // Queue via SoftThreads dispatcher if available; otherwise send directly
-                if (_softDispatcher != null)
-                {
-                    _softDispatcher.Enqueue(selectedAgentId, taskId, taskPayload);
-                    Log($"Queued SoftThread for {app.Name} (task {i}) to {selectedAgentId}");
-                }
-                else
-                {
-                    master?.DispatchTaskToAgent(taskPayload, selectedAgentId);
-                    Log($"Dispatched compute task {app.Name} (task {i}) to {selectedAgentId}");
-                }
-
-                taskHistory.Add(taskPayload);
-
-                Dispatcher.Invoke(() =>
-                {
-                    tasks.Add(new TaskInfo
-                    {
-                        TaskId = taskId,
-                        Description = taskPayload,
-                        AgentId = selectedAgentId,
-                        Timestamp = DateTime.Now
-                    });
-
-                    // If this label exists in your XAML, keep it updated.
-                    try { TaskCountLabel.Text = tasks.Count.ToString(); } catch { /* ignore if not present */ }
-                });
-
-                taskSequenceId++;
-            }
-
-            // Keep the SoftThreads summary fresh (no-op on Agent / if controls missing)
-            UpdateSoftThreadStats();
-        }
-
 
         private void ReassembleComputeResults(string appName)
         {
             if (computeResults.TryGetValue(appName, out var results))
             {
-                var orderedResults = results.OrderBy(r => r.SequenceId).Select(r => r.Result).ToList();
-                Log($"Reassembled results for {appName}: {string.Join(", ", orderedResults)}");
+                var ordered = results.OrderBy(r => r.SequenceId).Select(r => r.Result).ToList();
+                Log($"Reassembled results for {appName}: {string.Join(", ", ordered)}");
             }
         }
 
-        // ===================== Heartbeat =====================
-
-        private void SetupHeartbeat()
+        // ===================== UI actions =====================
+        private void SchedulerModeDropdown_Changed(object sender, SelectionChangedEventArgs e)
         {
-            heartbeatTimer = new System.Timers.Timer(settings.HeartbeatIntervalMs);
-            heartbeatTimer.Elapsed += (s, e) => Dispatcher.Invoke(UpdateHeartbeat);
-            heartbeatTimer.AutoReset = true;
-            heartbeatTimer.Start();
+            if (sender is ComboBox cb && cb.SelectedItem is ComboBoxItem item)
+            {
+                var modeText = item.Content?.ToString();
+                if (Enum.TryParse(modeText, out SchedulerMode mode))
+                {
+                    selectedMode = mode;
+                    if (currentRole == NodeRole.Master && scheduler != null)
+                    {
+                        scheduler.SetMode(mode);
+                        Log($"Scheduler mode set to: {mode}");
+                    }
+                }
+            }
+        }
+
+        private void Broadcast_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                // Send Ping with identity so Agents can unicast back
+                var masterId = "Master";
+                var masterIp = GetLocalIPAddress();
+                if (!string.IsNullOrWhiteSpace(masterIp))
+                {
+                    settings.MasterIp = masterIp;
+                    SaveSettings();
+                }
+                var seq = Environment.TickCount & 0x7FFFFFFF;
+
+                if (!comm.BroadcastPing(masterId, masterIp, seq))
+                {
+                    Log("BroadcastPing failed; falling back to generic broadcast.");
+                    comm.Broadcast($"Ping-{seq}");
+                }
+                Log($"Broadcast Ping sent: {masterId} {masterIp} #{seq}");
+
+                // Fallback: unicast WhoIsAlive to known endpoints
+                foreach (var a in agentStatuses.ToList())
+                {
+                    if (!string.IsNullOrWhiteSpace(a.AgentId) && a.AgentId != "Master")
+                        comm.SendWhoIsAlive(a.AgentId);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"Broadcast failed: {ex.Message}");
+            }
+        }
+
+        private void CustomTaskButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (currentRole != NodeRole.Master) { Log("Custom tasks only in Master mode."); return; }
+            string task = TaskInputBox.Text;
+            if (string.IsNullOrWhiteSpace(task)) { Log("No custom task entered."); return; }
+
+            var agent = agentStatuses.FirstOrDefault(a => a.IsOnline && a.AgentId != "Master");
+            if (agent == null) { Log("No online agents."); return; }
+
+            string taskId = Guid.NewGuid().ToString();
+            string payload = $"CustomTask:{taskId}:{task}";
+
+            if (_softDispatcher != null)
+                _softDispatcher.Enqueue(agent.AgentId, taskId, payload);
+            else if (master != null)
+                master.DispatchTaskToAgent(payload, agent.AgentId);
+            else
+                comm.SendToAgent(agent.AgentId, payload);
+
+            Log($"Sent custom task: {task} to {agent.AgentId}");
+            taskHistory.Add($"{DateTime.Now:T}: Sent {task} to {agent.AgentId}");
+            tasks.Add(new TaskInfo { TaskId = taskId, Description = task, AgentId = agent.AgentId, Timestamp = DateTime.Now });
+            TaskCountLabel.Text = tasks.Count.ToString();
+        }
+
+        private void StopTaskMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            if (currentRole != NodeRole.Master) { Log("Stop only in Master mode."); return; }
+            if (TaskListBox.SelectedItem is not TaskInfo t) { Log("No task selected."); return; }
+
+            master?.DispatchTaskToAgent($"StopTask:{t.TaskId}", t.AgentId);
+            Log($"Requested stop {t.TaskId} on {t.AgentId}");
+            taskHistory.Add($"{DateTime.Now:T}: Stop {t.TaskId} on {t.AgentId}");
+        }
+
+        // v1.0.1: Register button now uses HTTP control plane (RegistrationClient) instead of UDP
+        private async void RegisterAgent_Click(object sender, RoutedEventArgs e)
+        {
+            if (currentRole != NodeRole.Master) return;
+
+            if (NodeGrid.SelectedItem is not AgentStatus sel || sel.AgentId == "Master")
+            {
+                Log("Select an Agent row first.");
+                return;
+            }
+
+            // Use the configured default port (row has no ControlPort field)
+            int port = _cfg.ControlPort;
+
+            var ok = await _regClient.TryRegisterAsync(
+                agentIp: sel.IpAddress ?? string.Empty,
+                agentPort: port,
+                masterId: "Master",                      // matches your current design
+                masterIp: GetLocalIPAddress(),
+                bearerToken: _cfg.AuthToken,
+                log: Log);
+
+            Log(ok
+                ? $"Registered {sel.AgentId} at {sel.IpAddress}:{port} via HTTP ✅"
+                : $"Failed to register {sel.AgentId} at {sel.IpAddress}:{port} via HTTP");
+        }
+
+
+        private void UpdateAgentConfig_Click(object sender, RoutedEventArgs e)
+        {
+            if (currentRole != NodeRole.Master) { Log("Only in Master mode."); return; }
+            if (NodeGrid.SelectedItem is not AgentStatus row || row.AgentId == "Master")
+            {
+                Log("Select an Agent row first."); return;
+            }
+            var ok = comm.SendToAgent(row.AgentId, "RequestConfig");
+            Log(ok ? $"Requested config from {row.AgentId}" : $"Could not reach {row.AgentId}");
+        }
+
+        private void StopAllTasksButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (currentRole != NodeRole.Master) { Log("Only in Master mode."); return; }
+            var ids = agentStatuses.Where(a => a.AgentId != "Master" && a.IsOnline).Select(a => a.AgentId).ToList();
+            foreach (var id in ids) master?.DispatchTaskToAgent("StopAllTasks", id);
+            Log("Requested StopAllTasks on all online agents");
+        }
+
+        private void DispatchTask_Click(object sender, RoutedEventArgs e)
+        {
+            if (currentRole != NodeRole.Master) { Log("Only in Master mode."); return; }
+
+            var target = agentStatuses.FirstOrDefault(a => a.IsOnline && a.AgentId != "Master");
+            if (target == null) { Log("No online agents to dispatch."); return; }
+
+            var seq = taskSequenceId++;
+            string taskId = $"task-{seq}";
+            string payload = $"Compute:QuickSmoke|{seq}|noop";
+
+            if (_softDispatcher != null)
+                _softDispatcher.Enqueue(target.AgentId, taskId, payload);
+            else if (master != null)
+                master.DispatchTaskToAgent(payload, target.AgentId);
+            else
+                comm.SendToAgent(target.AgentId, payload);
+
+            Log($"Dispatched test task to {target.AgentId}: {payload}");
+        }
+
+        private async void ComputeTest_Click(object sender, RoutedEventArgs e)
+        {
+            if (currentRole != NodeRole.Master) { Log("Only in Master mode."); return; }
+            var targets = agentStatuses.Where(a => a.IsOnline && a.AgentId != "Master").ToList();
+            if (targets.Count == 0) { Log("No online agents to test."); return; }
+
+            var runId = Guid.NewGuid().ToString("N");
+            foreach (var a in targets)
+            {
+                var payload = $"Compute:QuickSmoke|0|noop";
+                var tid = $"smoke-{runId}-{a.AgentId}";
+                if (_softDispatcher != null) _softDispatcher.Enqueue(a.AgentId, tid, payload);
+                else comm.SendToAgent(a.AgentId, payload);
+            }
+
+            await Task.Delay(1500);
+            Log("ComputeTest round dispatched.");
+        }
+
+        private void SettingsButton_Click(object sender, RoutedEventArgs e)
+        {
+            var sw = new SettingsWindow(settings, agentStatuses.ToList(), false);
+            sw.Owner = this;
+            sw.ShowDialog();
+            ApplySettings();
+        }
+
+        private void ExitButton_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                DisposeSoftThreads();
+                StopMdns();
+                SaveSettings();
+            }
+            catch { }
+            Application.Current.Shutdown();
         }
 
         private void ApplySettings()
         {
-            Log($"Heartbeat Interval: {settings.HeartbeatIntervalMs} ms");
-            Log($"Use GPU Globally: {settings.UseGpuGlobally}");
-            heartbeatTimer.Interval = settings.HeartbeatIntervalMs;
+            heartbeatTimer.Interval = Math.Max(1000, settings.HeartbeatIntervalMs);
+            Log($"Heartbeat: {heartbeatTimer.Interval} ms, Master IP: {settings.MasterIp}");
+        }
+
+        // NEW: Hamburger → Open Logs
+        private void OpenLogsMenu_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var path = System.IO.Path.GetFullPath(MasterLogPath);
+                var dir = System.IO.Path.GetDirectoryName(path);
+
+                if (System.IO.File.Exists(path))
+                {
+                    // Open Explorer with the log file selected
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = "explorer.exe",
+                        Arguments = $"/select,\"{path}\"",
+                        UseShellExecute = true
+                    });
+                }
+                else if (!string.IsNullOrEmpty(dir))
+                {
+                    // Ensure folder exists, then open it
+                    System.IO.Directory.CreateDirectory(dir);
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = dir,
+                        UseShellExecute = true
+                    });
+                }
+                else
+                {
+                    MessageBox.Show(this, "No log file or folder to open yet.", "Logs",
+                        MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"Couldn't open log location:\n{ex.Message}", "Logs",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+        private void HelpMenu_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                // Try to open a bundled help file if present
+                var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                var html = System.IO.Path.Combine(baseDir, "HELP.html");
+                var md = System.IO.Path.Combine(baseDir, "HELP.md");
+                var readmeHtml = System.IO.Path.Combine(baseDir, "README.html");
+                var readmeMd = System.IO.Path.Combine(baseDir, "README.md");
+
+                string? toOpen = null;
+                if (File.Exists(html)) toOpen = html;
+                else if (File.Exists(md)) toOpen = md;
+                else if (File.Exists(readmeHtml)) toOpen = readmeHtml;
+                else if (File.Exists(readmeMd)) toOpen = readmeMd;
+
+                if (toOpen != null)
+                {
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = toOpen,
+                        UseShellExecute = true
+                    });
+                }
+                else
+                {
+                    MessageBox.Show(this,
+                        "Help is coming soon. For now, check the log and Settings for tips.",
+                        "Help",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"Couldn't open help: {ex.Message}", "Help",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        // ===================== Heartbeat (Master presence + Agent pulse) =====================
+        private void SetupHeartbeat()
+        {
+            heartbeatTimer = new System.Timers.Timer(Math.Max(1000, settings.HeartbeatIntervalMs)); // if Math.max errors in your env, change to Math.Max
+            heartbeatTimer.Elapsed += (s, e) => Dispatcher.Invoke(UpdateHeartbeat);
+            heartbeatTimer.AutoReset = true;
+            heartbeatTimer.Start();
         }
 
         private void UpdateHeartbeat()
         {
             if (currentRole == NodeRole.Master)
             {
-                // Build fresh list: Master self + agents from NodeMaster
-                var statuses = master != null ? master.GetAgentStatuses() : new List<AgentStatus>();
+                var nowUtc = DateTime.UtcNow;
 
-                // Ensure Master row at the top with current local metrics
-                var masterStatus = BuildLocalStatus("Master");
-                statuses.Insert(0, masterStatus);
-                agentStatuses = statuses;
+                // Ensure Master row
+                UpdateOrAddAgentStatus(BuildLocalStatus("Master"));
 
-                // Record first-seen for any new agents
-                foreach (var a in agentStatuses.Where(x => x.AgentId != "Master"))
-                    _plan.TouchFirstSeen(a.AgentId);
+                // Presence smoothing
+                foreach (var a in agentStatuses.ToList())
+                {
+                    if (a.AgentId.Equals("Master", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    if (_lastSeenUtc.TryGetValue(a.AgentId, out var seen))
+                    {
+                        var silence = nowUtc - seen;
+                        if (silence <= OfflineAfter) a.IsOnline = true;
+                        else if (silence <= RemoveAfter) a.IsOnline = false;
+                        else
+                        {
+                            // Remove if not selected
+                            if (!(NodeGrid?.SelectedItem is AgentStatus sel && sel.AgentId.Equals(a.AgentId, StringComparison.OrdinalIgnoreCase)))
+                                agentStatuses.Remove(a);
+                        }
+                    }
+                    else a.IsOnline = false;
+                }
 
                 MasterUptimeLabel.Text = (DateTime.Now - masterStartTime).ToString(@"hh\:mm\:ss");
+                RefreshGridPreservingSelection();
 
+                // Simple alerts
                 Dispatcher.Invoke(() =>
                 {
-                    NodeGrid.ItemsSource = null;
-                    NodeGrid.ItemsSource = agentStatuses;
-
                     AlertBox.Items.Clear();
-                    foreach (var status in agentStatuses)
+                    foreach (var s in agentStatuses)
                     {
-                        if (status.CpuUsagePercent > 85)
-                            AlertBox.Items.Add($"{status.AgentId} high CPU: {status.CpuUsagePercent:F0}%");
-                        if (!status.IsOnline)
-                            AlertBox.Items.Add($"{status.AgentId} is offline");
-                        if (status.HasGpu)
-                            AlertBox.Items.Add($"{status.AgentId} GPU: {status.GpuModel} ({status.GpuMemoryMB}MB)");
-                        else
-                            AlertBox.Items.Add($"{status.AgentId} has no GPU");
+                        if (s.AgentId == "Master") continue;
+                        if (!s.IsOnline) AlertBox.Items.Add($"{s.AgentId} is offline");
+                        else if (s.CpuUsagePercent > 85) AlertBox.Items.Add($"{s.AgentId} high CPU: {s.CpuUsagePercent:F0}%");
                     }
-
-                    // Free plan alerts
-                    _plan.AddOverCapAlerts(AlertBox);
                 });
+                return;
             }
             else
             {
-                // Agent heartbeat with local metrics
                 var id = localAgentId ?? $"Agent-{Environment.MachineName}";
-                var status = BuildLocalStatus(id);
-                status.TaskQueueLength = tasks.Count(t => t.AgentId == id);
+                var pulse = BuildAgentPulse(id);
+                comm.SendToMaster($"AgentPulse:{JsonSerializer.Serialize(pulse)}");
+                _lastSeenUtc[id] = DateTime.UtcNow;
 
-                comm.SendToMaster($"AgentStatus:{status.ToJson()}");
-                Log($"Heartbeat sent from agent at {DateTime.Now:T}");
+                // Update local UI row for Agent
+                var local = BuildLocalStatus(id);
+                local.CpuUsagePercent = pulse.CpuUsagePercent;
+                local.GpuUsagePercent = pulse.GpuUsagePercent;
+                local.MemoryAvailableMB = pulse.MemoryAvailableMB;
+                local.TaskQueueLength = pulse.TaskQueueLength;
+                local.LastHeartbeat = pulse.LastHeartbeat;
 
-                // Also update our local grid row
-                var existing = agentStatuses.FirstOrDefault(a => a.AgentId == id);
-                if (existing != null) agentStatuses.Remove(existing);
-                agentStatuses.Add(status);
-                Dispatcher.Invoke(() =>
-                {
-                    NodeGrid.ItemsSource = null;
-                    NodeGrid.ItemsSource = agentStatuses;
-                    UpdateSoftThreadStats();
-                });
-
-                // Power (Pro-only)
-                bool busy = tasks.Any(t => t.AgentId == id);
-                _power.OnAgentHeartbeat(busy);
-                _power.CheckPowerAction();
+                UpdateOrAddAgentStatus(local);
+                RefreshGridPreservingSelection();
             }
         }
 
-        // ===================== mDNS (Makaretu) =====================
-
+        // ===================== mDNS =====================
         private void EnsureMdnsStarted()
         {
-            if (mcast == null)
-            {
-                mcast = new MulticastService();
-                mcast.Start();
-            }
-
+            if (mcast == null) { mcast = new MulticastService(); mcast.Start(); }
             if (mdns == null)
             {
                 mdns = new ServiceDiscovery(mcast);
-
-                mdns.ServiceDiscovered += (s, serviceName) =>
-                {
-                    try { mdns.QueryServiceInstances(serviceName); } catch { /* ignore */ }
-                };
-
+                mdns.ServiceDiscovered += (s, serviceName) => { try { mdns.QueryServiceInstances(serviceName); } catch { } };
                 mdns.ServiceInstanceDiscovered += Mdns_ServiceInstanceDiscovered;
                 mdns.ServiceInstanceShutdown += Mdns_ServiceInstanceShutdown;
             }
-
-            try { mdns.QueryAllServices(); } catch { /* ignore */ }
+            try { mdns.QueryAllServices(); } catch { }
         }
 
         private void Mdns_ServiceInstanceDiscovered(object? sender, ServiceInstanceDiscoveryEventArgs e)
         {
             var fqdn = e.ServiceInstanceName?.ToString() ?? "";
             var ip = TryGetIp(e);
+            if (string.IsNullOrEmpty(fqdn) || string.IsNullOrEmpty(ip)) return;
 
-            if (string.IsNullOrEmpty(fqdn) || string.IsNullOrEmpty(ip))
-                return;
-
-            // MASTER service: cache Master IP
             if (fqdn.Contains("." + ServiceTypeMaster + ".", StringComparison.OrdinalIgnoreCase))
             {
                 settings.MasterIp = ip!;
                 SaveSettings();
-
-                Dispatcher.Invoke(() =>
-                {
-                    MasterStatusLabel.Text = "Online";
-                    MasterStatusLabel.Foreground = Brushes.Green;
-                });
-
+                MasterStatusLabel.Text = "Online";
+                MasterStatusLabel.Foreground = Brushes.Green;
                 Log($"Discovered Master at {ip}");
+                if (currentRole != NodeRole.Master) comm.SetMasterIp(ip!);
                 return;
             }
 
-            // AGENT service: normalize instance -> "Agent-HOST"
             if (fqdn.Contains("." + ServiceTypeAgent + ".", StringComparison.OrdinalIgnoreCase))
             {
-                var normalizedId = NormalizeAgentIdFromInstance(fqdn);
-                var existing = agentStatuses.FirstOrDefault(a => a.AgentId.Equals(normalizedId, StringComparison.OrdinalIgnoreCase));
+                var agentId = NormalizeAgentIdFromInstance(fqdn);
+                _lastSeenUtc[agentId] = DateTime.UtcNow;
+                comm.UpdateAgentEndpoint(agentId, ip!);
 
-                // Ensure NodeMaster is tracking this Agent ID (canonical)
-                if (existing == null && !normalizedId.Equals("Master", StringComparison.OrdinalIgnoreCase))
+                var row = new AgentStatus
                 {
-                    master?.RegisterAgent(normalizedId, msg => HandleAgentMessage(normalizedId, msg));
+                    AgentId = agentId,
+                    IsOnline = true,
+                    IpAddress = ip!,
+                    LastHeartbeat = DateTime.Now
+                    // ControlPort can be set from mDNS TXT later; default picked from _cfg when needed
+                };
+                UpdateOrAddAgentStatus(row);
+                RefreshGridPreservingSelection();
+                Log($"Discovered Agent {agentId} at {ip}");
 
-                    agentStatuses.Add(new AgentStatus
-                    {
-                        AgentId = normalizedId,
-                        IsOnline = true,
-                        IpAddress = ip!,
-                        CpuUsagePercent = 0f,
-                        GpuUsagePercent = 0f,
-                        MemoryAvailableMB = 0f,
-                        NetworkMbps = 0f,
-                        HasFileAccess = true,
-                        AvailableFiles = Array.Empty<string>(),
-                        TaskQueueLength = 0,
-                        LastHeartbeat = DateTime.Now
-                    });
-
-                    _plan.TouchFirstSeen(normalizedId);
-
-                    Dispatcher.Invoke(() =>
-                    {
-                        NodeGrid.ItemsSource = null;
-                        NodeGrid.ItemsSource = agentStatuses;
-                    });
-
-                    Log($"Discovered Agent {normalizedId} at {ip}");
-                }
-                else if (existing != null)
-                {
-                    existing.IsOnline = true;
-                    existing.IpAddress = ip!;
-                }
+                // v1.0.1 [B]: Auto-register via HTTP control plane (Master side only; harmless if called otherwise)
+                MasterBootstrapper.OnAgentDiscovered(row);
             }
         }
-
 
         private void Mdns_ServiceInstanceShutdown(object? sender, ServiceInstanceShutdownEventArgs e)
         {
@@ -1226,11 +1150,7 @@ namespace NodeLinkUI
                 if (existing != null && agentId != "Master")
                 {
                     existing.IsOnline = false;
-                    Dispatcher.Invoke(() =>
-                    {
-                        NodeGrid.ItemsSource = null;
-                        NodeGrid.ItemsSource = agentStatuses;
-                    });
+                    RefreshGridPreservingSelection();
                     Log($"Service removed: {agentId}");
                 }
             }
@@ -1238,8 +1158,7 @@ namespace NodeLinkUI
 
         private static string? TryGetIp(ServiceInstanceDiscoveryEventArgs e)
         {
-            var msg = e.Message;
-            if (msg == null) return null;
+            var msg = e.Message; if (msg == null) return null;
 
             var srv = msg.AdditionalRecords.OfType<SRVRecord>().FirstOrDefault();
             if (srv == null) return null;
@@ -1251,7 +1170,7 @@ namespace NodeLinkUI
             return aaaa?.Address.ToString();
         }
 
-        private async Task<string> DiscoverMasterIpAsync()
+        private async Task<string?> DiscoverMasterIpAsync()
         {
             try
             {
@@ -1284,30 +1203,20 @@ namespace NodeLinkUI
 
                 if (mdns != null) mdns.ServiceInstanceDiscovered -= handler!;
             }
-            catch (Exception ex)
-            {
-                Log($"mDNS Master discovery error: {ex.Message}");
-            }
+            catch (Exception ex) { Log($"mDNS Master discovery error: {ex.Message}"); }
+
             return null;
         }
 
         private async Task DiscoverAgentsAsync()
         {
-            try
-            {
-                EnsureMdnsStarted();
-                mdns!.QueryServiceInstances(ServiceTypeAgent);
-                await Task.Delay(200); // brief wait for callbacks
-            }
-            catch (Exception ex)
-            {
-                Log($"mDNS Agent discovery error: {ex.Message}");
-            }
+            try { EnsureMdnsStarted(); mdns!.QueryServiceInstances(ServiceTypeAgent); await Task.Delay(200); }
+            catch (Exception ex) { Log($"mDNS Agent discovery error: {ex.Message}"); }
         }
 
         private void SetupAgentDiscovery()
         {
-            agentDiscoveryTimer = new System.Timers.Timer(10000); // every 10s
+            agentDiscoveryTimer = new System.Timers.Timer(10000);
             agentDiscoveryTimer.Elapsed += (s, e) => DiscoverAgentsAsync().GetAwaiter().GetResult();
             agentDiscoveryTimer.AutoReset = true;
             agentDiscoveryTimer.Start();
@@ -1323,49 +1232,28 @@ namespace NodeLinkUI
                 mcast?.Stop();
                 mcast?.Dispose();
             }
-            catch { /* ignore */ }
-
-            mcast = null;
-            mdns = null;
-            mdnsMasterProfile = null;
-            mdnsAgentProfile = null;
+            catch { }
+            mcast = null; mdns = null; mdnsMasterProfile = null; mdnsAgentProfile = null;
         }
 
-        // ===================== Local system metrics helpers =====================
+        // ===================== Probes / Builders =====================
 
+        // CPU percent without P/Invoke
         private float GetSystemCpuUsagePercent()
         {
-            if (!GetSystemTimes(out var idle, out var kernel, out var user))
-                return 0f;
-
-            ulong idleTicks = ((ulong)idle.dwHighDateTime << 32) + (uint)idle.dwLowDateTime;
-            ulong kernelTicks = ((ulong)kernel.dwHighDateTime << 32) + (uint)kernel.dwLowDateTime;
-            ulong userTicks = ((ulong)user.dwHighDateTime << 32) + (uint)user.dwLowDateTime;
-
-            if (!_cpuInit)
+            try
             {
-                _prevIdleTicks = idleTicks;
-                _prevKernelTicks = kernelTicks;
-                _prevUserTicks = userTicks;
-                _cpuInit = true;
-                return 0f; // first call has no delta
+                if (_cpuTotalCounter == null)
+                {
+                    _cpuTotalCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
+                    _ = _cpuTotalCounter.NextValue(); // prime
+                    return 0f;
+                }
+                var v = _cpuTotalCounter.NextValue();
+                if (float.IsNaN(v)) return 0f;
+                return Math.Max(0f, Math.Min(100f, v));
             }
-
-            ulong idleDelta = idleTicks - _prevIdleTicks;
-            ulong kernelDelta = kernelTicks - _prevKernelTicks;
-            ulong userDelta = userTicks - _prevUserTicks;
-
-            _prevIdleTicks = idleTicks;
-            _prevKernelTicks = kernelTicks;
-            _prevUserTicks = userTicks;
-
-            ulong total = kernelDelta + userDelta;
-            if (total == 0) return 0f;
-
-            float busy = (float)(total - idleDelta) / total * 100f;
-            if (busy < 0f) busy = 0f;
-            if (busy > 100f) busy = 100f;
-            return busy;
+            catch { return 0f; }
         }
 
         private float GetAvailableMemoryMB()
@@ -1373,9 +1261,7 @@ namespace NodeLinkUI
             var msex = new MEMORYSTATUSEX();
             msex.dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
             if (GlobalMemoryStatusEx(ref msex))
-            {
                 return (float)(msex.ullAvailPhys / (1024.0 * 1024.0));
-            }
             return 0f;
         }
 
@@ -1383,44 +1269,33 @@ namespace NodeLinkUI
         {
             try
             {
-                using var searcher = new ManagementObjectSearcher(
-                    "SELECT Name, AdapterRAM, PNPDeviceID FROM Win32_VideoController");
+                using var searcher = new ManagementObjectSearcher("SELECT Name, AdapterRAM, PNPDeviceID FROM Win32_VideoController");
                 foreach (ManagementObject mo in searcher.Get())
                 {
                     string pnp = mo["PNPDeviceID"]?.ToString() ?? "";
-                    if (!pnp.Contains("PCI", StringComparison.OrdinalIgnoreCase))
-                        continue; // prefer PCI devices
+                    if (!pnp.Contains("PCI", StringComparison.OrdinalIgnoreCase)) continue;
 
                     string model = mo["Name"]?.ToString() ?? "GPU";
                     long bytes = 0;
                     var ramObj = mo["AdapterRAM"];
-                    if (ramObj != null)
-                    {
-                        try { bytes = Convert.ToInt64(ramObj); } catch { bytes = 0; }
-                    }
+                    if (ramObj != null) { try { bytes = Convert.ToInt64(ramObj); } catch { bytes = 0; } }
                     int mb = (int)Math.Round(bytes / (1024.0 * 1024.0));
                     return (mb > 0, model, mb);
                 }
 
-                // Fallback: first controller
-                using var searcher2 = new ManagementObjectSearcher(
-                    "SELECT Name, AdapterRAM FROM Win32_VideoController");
+                using var searcher2 = new ManagementObjectSearcher("SELECT Name, AdapterRAM FROM Win32_VideoController");
                 var first = searcher2.Get().Cast<ManagementObject>().FirstOrDefault();
                 if (first != null)
                 {
                     string model = first["Name"]?.ToString() ?? "GPU";
                     long bytes = 0;
                     var ramObj = first["AdapterRAM"];
-                    if (ramObj != null)
-                    {
-                        try { bytes = Convert.ToInt64(ramObj); } catch { bytes = 0; }
-                    }
+                    if (ramObj != null) { try { bytes = Convert.ToInt64(ramObj); } catch { bytes = 0; } }
                     int mb = (int)Math.Round(bytes / (1024.0 * 1024.0));
                     return (mb > 0, model, mb);
                 }
             }
-            catch { /* ignore */ }
-
+            catch { }
             return (false, string.Empty, 0);
         }
 
@@ -1437,14 +1312,13 @@ namespace NodeLinkUI
                     .Where(c => c.CounterName == "Utilization Percentage")
                     .ToList();
 
-                foreach (var c in _gpuCounters) _ = c.NextValue(); // prime
+                foreach (var c in _gpuCounters) _ = c.NextValue();
             }
-            catch
-            {
-                _gpuCounters = null;
-            }
+            catch { _gpuCounters = null; }
             _gpuCountersInit = true;
         }
+        private List<PerformanceCounter>? _gpuCounters;
+        private bool _gpuCountersInit;
 
         private float GetGpuUtilizationPercent()
         {
@@ -1456,11 +1330,9 @@ namespace NodeLinkUI
                 float sum = 0f;
                 foreach (var c in _gpuCounters)
                 {
-                    try { sum += c.NextValue(); } catch { /* ignore this counter */ }
+                    try { sum += c.NextValue(); } catch { }
                 }
-                if (sum < 0f) sum = 0f;
-                if (sum > 100f) sum = 100f; // cap
-                return sum;
+                return Math.Max(0, Math.Min(100, sum));
             }
             catch { return 0f; }
         }
@@ -1469,8 +1341,7 @@ namespace NodeLinkUI
         {
             try
             {
-                using var s = new ManagementObjectSearcher(
-                    "SELECT Name, PNPDeviceID FROM Win32_VideoController");
+                using var s = new ManagementObjectSearcher("SELECT Name, PNPDeviceID FROM Win32_VideoController");
                 int count = 0;
                 foreach (ManagementObject mo in s.Get())
                 {
@@ -1478,9 +1349,7 @@ namespace NodeLinkUI
                     string pnp = mo["PNPDeviceID"]?.ToString() ?? "";
                     if (pnp.IndexOf("PCI", StringComparison.OrdinalIgnoreCase) >= 0 &&
                         name.IndexOf("Microsoft Basic Display", StringComparison.OrdinalIgnoreCase) < 0)
-                    {
                         count++;
-                    }
                 }
                 return count;
             }
@@ -1507,13 +1376,11 @@ namespace NodeLinkUI
                 TaskQueueLength = tasks.Count(t => t.AgentId == agentId),
                 LastHeartbeat = DateTime.Now,
 
-                // v1 single-GPU fields
                 HasGpu = hasGpu,
                 HasCuda = false,
                 GpuModel = gpuModel,
                 GpuMemoryMB = vramMB,
 
-                // For Pro upsell on Master (Agent restarts + multi-GPU detection)
                 GpuCount = GetGpuCountLocal(),
                 InstanceId = _thisInstanceId,
 
@@ -1523,21 +1390,143 @@ namespace NodeLinkUI
             };
         }
 
-        // P/Invoke: CPU times
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool GetSystemTimes(out FILETIME idleTime, out FILETIME kernelTime, out FILETIME userTime);
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct FILETIME
+        private NodeCore.AgentConfig BuildAgentConfig(string agentId)
         {
-            public uint dwLowDateTime;
-            public uint dwHighDateTime;
+            var (hasGpu, gpuModel, vramMB) = GetPrimaryGpuInfo();
+            return new NodeCore.AgentConfig
+            {
+                AgentId = agentId,
+                CpuLogicalCores = Environment.ProcessorCount,
+                RamTotalMB = GetTotalPhysicalRamMB(),
+                HasGpu = hasGpu,
+                GpuModel = gpuModel,
+                GpuMemoryMB = vramMB,
+                GpuCount = GetGpuCountLocal(),
+                OsVersion = Environment.OSVersion.ToString(),
+                InstanceId = _thisInstanceId
+            };
         }
 
-        // P/Invoke: Memory status
+        private NodeCore.AgentPulse BuildAgentPulse(string agentId)
+        {
+            return new NodeCore.AgentPulse
+            {
+                AgentId = agentId,
+                CpuUsagePercent = GetSystemCpuUsagePercent(),
+                MemoryAvailableMB = GetAvailableMemoryMB(),
+                GpuUsagePercent = GetGpuUtilizationPercent(),
+                TaskQueueLength = tasks.Count(t => t.AgentId == agentId),
+                NetworkMbps = 0f,
+                DiskReadMBps = 0f,
+                DiskWriteMBps = 0f,
+                LastHeartbeat = DateTime.Now
+            };
+        }
+
+        private float GetTotalPhysicalRamMB()
+        {
+            try
+            {
+                using var cs = new ManagementObjectSearcher("SELECT TotalVisibleMemorySize FROM Win32_OperatingSystem");
+                foreach (ManagementObject mo in cs.Get())
+                {
+                    if (mo["TotalVisibleMemorySize"] != null)
+                    {
+                        double kb = Convert.ToDouble(mo["TotalVisibleMemorySize"]);
+                        return (float)(kb / 1024.0);
+                    }
+                }
+            }
+            catch { }
+            return 0f;
+        }
+
+        // ---------- Grid helpers ----------
+        private void RefreshGridPreservingSelection()
+        {
+            try
+            {
+                if (NodeGrid.SelectedItem is AgentStatus sel)
+                    _selectedAgentId = sel.AgentId;
+
+                agentView?.Refresh();
+
+                if (!string.IsNullOrWhiteSpace(_selectedAgentId))
+                {
+                    var match = agentStatuses.FirstOrDefault(a => a.AgentId.Equals(_selectedAgentId, StringComparison.OrdinalIgnoreCase));
+                    if (match != null) NodeGrid.SelectedItem = match;
+                }
+            }
+            catch { }
+        }
+
+        private AgentStatus UpdateOrAddAgentStatus(AgentStatus incoming)
+        {
+            var existing = agentStatuses.FirstOrDefault(a => a.AgentId.Equals(incoming.AgentId, StringComparison.OrdinalIgnoreCase));
+            if (existing == null)
+            {
+                agentStatuses.Add(incoming);
+                return incoming;
+            }
+
+            existing.IsOnline = incoming.IsOnline;
+            existing.IpAddress = incoming.IpAddress;
+            existing.CpuUsagePercent = incoming.CpuUsagePercent;
+            existing.GpuUsagePercent = incoming.GpuUsagePercent;
+            existing.CpuLogicalCores = incoming.CpuLogicalCores;
+            existing.MemoryAvailableMB = incoming.MemoryAvailableMB;
+            existing.NetworkMbps = incoming.NetworkMbps;
+            existing.HasFileAccess = incoming.HasFileAccess;
+            existing.AvailableFiles = incoming.AvailableFiles;
+            existing.TaskQueueLength = incoming.TaskQueueLength;
+            existing.LastHeartbeat = incoming.LastHeartbeat;
+
+            existing.HasGpu = incoming.HasGpu;
+            existing.HasCuda = incoming.HasCuda;
+            existing.GpuModel = incoming.GpuModel;
+            existing.GpuMemoryMB = incoming.GpuMemoryMB;
+            existing.GpuCount = incoming.GpuCount;
+            existing.InstanceId = incoming.InstanceId;
+
+            existing.LastTaskDuration = incoming.LastTaskDuration;
+            existing.DiskReadMBps = incoming.DiskReadMBps;
+            existing.DiskWriteMBps = incoming.DiskWriteMBps;
+
+            existing.SelfTestStatus = incoming.SelfTestStatus;
+
+            return existing;
+        }
+
+        private static string NormalizeAgentIdFromInstance(string? instanceName)
+        {
+            if (string.IsNullOrWhiteSpace(instanceName)) return "Agent-Unknown";
+            var left = instanceName;
+            var dot = left.IndexOf('.');
+            if (dot > 0) left = left[..dot];
+
+            const string prefix = "NodeLinkAgent-";
+            if (left.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                left = "Agent-" + left[prefix.Length..];
+
+            if (!left.StartsWith("Agent-", StringComparison.OrdinalIgnoreCase))
+                left = "Agent-" + left;
+
+            return left;
+        }
+
+        // Extra: About + no-op security refresh for Settings window
+        private void AboutMenu_Click(object sender, RoutedEventArgs e)
+        {
+            var asm = Assembly.GetEntryAssembly() ?? Assembly.GetExecutingAssembly();
+            var name = asm.GetName();
+            var ver = name.Version?.ToString() ?? "0.0.0.0";
+            MessageBox.Show(this, $"NodeLinkUI\nVersion: {ver}", "About", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        public void RefreshCommunicationSecurity() { /* v1-lite: no-op */ }
+
+        // Memory P/Invoke (kept)
         [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
-
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
         private struct MEMORYSTATUSEX
         {
@@ -1551,28 +1540,14 @@ namespace NodeLinkUI
             public ulong ullAvailVirtual;
             public ulong ullAvailExtendedVirtual;
         }
-        private static string NormalizeAgentIdFromInstance(string? instanceName)
-        {
-            if (string.IsNullOrWhiteSpace(instanceName))
-                return "Agent-Unknown";
-
-            // Take leftmost label if a full FQDN was provided.
-            var left = instanceName;
-            var dot = left.IndexOf('.');
-            if (dot > 0) left = left.Substring(0, dot);
-
-            const string mdnsPrefix = "NodeLinkAgent-";
-            if (left.StartsWith(mdnsPrefix, System.StringComparison.OrdinalIgnoreCase))
-                left = "Agent-" + left.Substring(mdnsPrefix.Length);
-
-            // Ensure canonical prefix even if something else slips through
-            if (!left.StartsWith("Agent-", System.StringComparison.OrdinalIgnoreCase))
-                left = "Agent-" + left;
-
-            return left;
-        }
     }
 }
+
+
+
+
+
+
 
 
 

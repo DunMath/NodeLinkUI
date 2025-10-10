@@ -1,50 +1,207 @@
-﻿using System;
+﻿// NodeAgent/NodeAgent.cs
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Management;
 using System.Net.NetworkInformation;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Timers;
+
 using NodeComm;
 using NodeCore;
 
 namespace NodeAgent
 {
-    public class NodeAgent : IDisposable
+    /// <summary>
+    /// Lightweight agent runtime that:
+    ///  - Listens for RegisterRequest and replies with RegisterAck (caps as JSON).
+    ///  - Starts heartbeats only after successful registration.
+    ///  - Emits static AgentConfig (rare) and volatile AgentPulse (frequent).
+    ///  - Executes simple CustomTask/Compute messages with cancellation & result reporting.
+    /// </summary>
+    public sealed class NodeAgent
     {
-        public string Id { get; private set; }
+        // ------------ Public identity ------------
+        public string Id { get; }
+
+        // ------------ Comms ------------
         private readonly CommChannel comm;
+
+        // ------------ Registration state ------------
+        private volatile bool _isRegistered = false;
+        private string? _managerId = null;
+        private DateTime _lastRegisterAck = DateTime.MinValue;
+
+        // ------------ Heartbeat ------------
         private readonly System.Timers.Timer heartbeatTimer;
-        private int taskQueueLength = 0;
-        private TimeSpan lastTaskDuration = TimeSpan.Zero;
-        private readonly Dictionary<string, CancellationTokenSource> taskCancellationTokens = new(); // Track tasks by ID for cancellation
         private readonly string _instanceId = Guid.NewGuid().ToString();
+
+        // ------------ Task bookkeeping ------------
+        private readonly Dictionary<string, CancellationTokenSource> taskCancellationTokens = new();
+        private volatile int taskQueueLength = 0;
+        private TimeSpan lastTaskDuration = TimeSpan.Zero;
+
+        // ------------ JSON options ------------
+        private static readonly JsonSerializerOptions JsonOpts = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            WriteIndented = false
+        };
 
         public NodeAgent(string id, CommChannel comm)
         {
             Id = id ?? throw new ArgumentNullException(nameof(id));
             this.comm = comm ?? throw new ArgumentNullException(nameof(comm));
 
-            // Register receive handler for this agent id
-            comm.Register(id, ReceiveMessage);
+            // Subscribe to the shared CommChannel; only handle messages routed to this agent id.
+            this.comm.OnMessageReceived += (targetId, message) =>
+            {
+                try
+                {
+                    if (string.Equals(targetId, Id, StringComparison.OrdinalIgnoreCase))
+                        ReceiveMessage(message);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Agent {Id} OnMessageReceived error: {ex.Message}");
+                }
+            };
 
+            // Heartbeat (disabled until registration completes)
             heartbeatTimer = new System.Timers.Timer(5000);
-            heartbeatTimer.Elapsed += (s, e) => SendHeartbeat();
-            heartbeatTimer.Start();
+            heartbeatTimer.AutoReset = true;
+            heartbeatTimer.Elapsed += (s, e) => SendPulse();
+            // Important: do NOT Start here; we start after RegisterAck.
         }
 
-        // ------------- Message handling -------------
-
+        // =====================================================================
+        // Message handling
+        // =====================================================================
         private void ReceiveMessage(string message)
         {
             if (string.IsNullOrWhiteSpace(message)) return;
-
-            Console.WriteLine($"Agent {Id} received message: {message}");
+            Console.WriteLine($"Agent {Id} received: {message}");
 
             try
             {
+                // -------- Register handshake --------
+                if (message.StartsWith("RegisterRequest:", StringComparison.OrdinalIgnoreCase))
+                {
+                    _managerId = message.Substring("RegisterRequest:".Length).Trim();
+                    _isRegistered = true;
+
+                    SendRegisterAck();           // reply with capabilities (legacy, still useful)
+                    SendAgentConfig();           // static config once on register
+                    SendPulse();                 // immediate first pulse
+                    if (!heartbeatTimer.Enabled) // begin pulses
+                        heartbeatTimer.Start();
+
+                    // Optional quick pong for UX
+                    comm.SendToMaster($"PingReply:{Id}");
+                    return;
+                }
+
+                // -------- NEW: Ping with master identity (from broadcast) --------
+                // Expected format: Ping:<MasterId>:<MasterIp>:<Seq>
+                if (message.StartsWith("Ping:", StringComparison.OrdinalIgnoreCase))
+                {
+                    var parts = message.Split(':');
+                    if (parts.Length >= 4)
+                    {
+                        var masterId = parts[1].Trim();
+                        var masterIp = parts[2].Trim();
+                        var seq = parts[3].Trim();
+
+                        // Teach CommChannel where to unicast replies
+                        comm.SetMasterIp(masterIp);
+
+                        // Immediately reply via UNICAST so Master can lock onto us fast
+                        comm.SendToMaster($"Pong:{Id}:{seq}");
+                        SendAgentConfig();
+                        SendPulse();
+
+                        // If we weren't "registered" via RegisterRequest yet, allow pulses to start now
+                        if (!_isRegistered)
+                        {
+                            _managerId = masterId;
+                            _isRegistered = true;
+                            if (!heartbeatTimer.Enabled) heartbeatTimer.Start();
+                        }
+                        return;
+                    }
+
+                    // If format didn't match, fall through to generic Ping handler below
+                }
+
+                // -------- Keep-alive (generic Ping) --------
+                if (message.StartsWith("Ping", StringComparison.OrdinalIgnoreCase))
+                {
+                    comm.SendToMaster($"PingReply:{Id}");
+                    return;
+                }
+
+                // -------- Master asks for fresh static config --------
+                if (string.Equals(message, "RequestConfig", StringComparison.OrdinalIgnoreCase))
+                {
+                    SendAgentConfig();
+                    return;
+                }
+
+                // -------- Master solicits presence from already running agents --------
+                if (string.Equals(message, "WhoIsAlive", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Even if not "registered" via RegisterRequest yet, answer with config+pulse
+                    SendAgentConfig();
+                    SendPulse();
+                    return;
+                }
+
+                // -------- ComputeTest (tiny synthetic work; Master checks these results) --------
+                if (message.StartsWith("ComputeTest:", StringComparison.OrdinalIgnoreCase))
+                {
+                    var testId = message.Substring("ComputeTest:".Length).Trim();
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            long acc = 0;
+                            for (int i = 1; i <= 50; i++) acc += i;
+                            await Task.Delay(10);
+
+                            // Send a clear, explicit result back to Master (UNICAST)
+                            comm.SendToMaster($"ComputeTestResult:{Id}:{testId}:OK");
+                        }
+                        catch
+                        {
+                            comm.SendToMaster($"ComputeTestResult:{Id}:{testId}:FAIL");
+                        }
+                    });
+                    return;
+                }
+
+                // -------- Compute (very small demo workload with ordered result) --------
+                if (message.StartsWith("Compute:", StringComparison.OrdinalIgnoreCase))
+                {
+                    var body = message.Substring("Compute:".Length);
+                    var tokens = body.Split('|'); // app|seq|payload
+                    if (tokens.Length >= 2)
+                    {
+                        var app = tokens[0];
+                        var seq = tokens[1];
+                        _ = Task.Run(async () =>
+                        {
+                            long acc = 0;
+                            for (int i = 1; i <= 5000; i++) acc += i;
+                            await Task.Delay(30);
+                            comm.SendToMaster($"ComputeResult:{app}|{seq}|OK:{Id}");
+                        });
+                        return;
+                    }
+                }
+
+                // -------- CustomTask (ad-hoc string payload) --------
                 if (message.StartsWith("CustomTask:", StringComparison.OrdinalIgnoreCase))
                 {
                     var parts = message.Split(':');
@@ -57,6 +214,7 @@ namespace NodeAgent
                     return;
                 }
 
+                // -------- Stop one task --------
                 if (message.StartsWith("StopTask:", StringComparison.OrdinalIgnoreCase))
                 {
                     var parts = message.Split(':');
@@ -72,56 +230,19 @@ namespace NodeAgent
                     return;
                 }
 
+                // -------- Stop all tasks --------
                 if (string.Equals(message, "StopAllTasks", StringComparison.OrdinalIgnoreCase))
                 {
                     foreach (var kvp in taskCancellationTokens)
                         kvp.Value.Cancel();
-
                     taskCancellationTokens.Clear();
                     taskQueueLength = 0;
                     Console.WriteLine($"Agent {Id} cancelled all tasks");
                     return;
                 }
 
-                if (message.StartsWith("Ping", StringComparison.OrdinalIgnoreCase))
-                {
-                    comm.SendToMaster($"PingReply:{Id}");
-                    return;
-                }
-
-                // ---- New: compute test endpoint (exercises the real compute pipe) ----
-                if (message.StartsWith("ComputeTest:", StringComparison.OrdinalIgnoreCase))
-                {
-                    var testId = message.Substring("ComputeTest:".Length).Trim();
-                    _ = Task.Run(() => HandleComputeTestAsync(testId));
-                    return;
-                }
-
-                // ---- New: handle "Compute:{app}|{seq}|{payload}" and report back ----
-                if (message.StartsWith("Compute:", StringComparison.OrdinalIgnoreCase))
-                {
-                    var body = message.Substring("Compute:".Length);
-                    // Expected: app|seq|payloadId
-                    var tokens = body.Split('|');
-                    if (tokens.Length >= 2)
-                    {
-                        var app = tokens[0];
-                        var seq = tokens[1];
-
-                        // Simulate some quick work to exercise the pipe
-                        _ = Task.Run(async () =>
-                        {
-                            long acc = 0;
-                            for (int i = 1; i <= 5000; i++) acc += i;
-                            await Task.Delay(30);
-                            comm.SendToMaster($"ComputeResult:{app}|{seq}|OK:{Id}");
-                        });
-                        return;
-                    }
-                }
-
-                // Fallback to original ExecuteTask without ID
-                ExecuteTask(Guid.NewGuid().ToString(), message);
+                // Fallback: treat message as a generic task
+                ExecuteTask(Guid.NewGuid().ToString("N"), message);
             }
             catch (Exception ex)
             {
@@ -130,252 +251,121 @@ namespace NodeAgent
             }
         }
 
-        private async Task HandleComputeTestAsync(string testId)
+        // =====================================================================
+        // Register ACK (legacy capabilities snapshot)
+        // =====================================================================
+        private void SendRegisterAck()
         {
-            try
+            var caps = new
             {
-                // Do a tiny bit of “work”
-                long acc = 0;
-                for (int i = 1; i <= 10000; i++) acc += i;
-                await Task.Delay(50);
+                agent_id = Id,
+                instance_id = _instanceId,
+                cpu_cores = Environment.ProcessorCount,
 
-                comm.SendToMaster($"ComputeTestResult:{Id}:{testId}:OK");
-            }
-            catch
-            {
-                comm.SendToMaster($"ComputeTestResult:{Id}:{testId}:FAIL");
-            }
+                has_gpu = TryDetectGpu(out string gpuModel, out int gpuMemMB, out int gpuCount),
+                gpu_model = gpuModel,
+                gpu_mem_mb = gpuMemMB,
+                gpu_count = gpuCount,
+
+                heartbeat_ms = (int)heartbeatTimer.Interval
+            };
+
+            string json = JsonSerializer.Serialize(caps, JsonOpts);
+            comm.SendToMaster($"RegisterAck:{Id}:{json}");
+            _lastRegisterAck = DateTime.UtcNow;
         }
 
-        // ------------- Generic Task Execution -------------
-
-        public void ExecuteTask(string taskId, string task)
+        // =====================================================================
+        // Static config (rare)
+        // =====================================================================
+        private void SendAgentConfig()
         {
-            var cts = new CancellationTokenSource();
-            taskCancellationTokens[taskId] = cts;
-            taskQueueLength++;
-            var start = DateTime.Now;
-
-            Console.WriteLine($"Agent {Id} executing task {taskId}: {task}");
-
-            try
-            {
-                if (task.StartsWith("add:", StringComparison.OrdinalIgnoreCase))
-                {
-                    var parts = task.Split(':');
-                    if (parts.Length == 3 &&
-                        int.TryParse(parts[1], out int startNum) &&
-                        int.TryParse(parts[2], out int end))
-                    {
-                        int sum = 0;
-                        for (int i = startNum; i <= end && !cts.Token.IsCancellationRequested; i++)
-                        {
-                            sum += i;
-                            Thread.Sleep(1); // allow cancellation
-                        }
-
-                        if (!cts.Token.IsCancellationRequested)
-                            comm.SendToMaster($"Result:{taskId}: {sum}");
-                        else
-                            comm.SendToMaster($"Interrupted:{taskId}");
-                    }
-                }
-                else if (task.StartsWith("Launch:", StringComparison.OrdinalIgnoreCase))
-                {
-                    var parts = task.Split('|');
-                    if (parts.Length == 2)
-                    {
-                        try
-                        {
-                            var process = Process.Start(parts[1]);
-                            if (process != null && !cts.Token.IsCancellationRequested)
-                            {
-                                process.WaitForExit();
-                                comm.SendToMaster($"Launched:{parts[0].Split(':')[1]}");
-                            }
-                            else
-                            {
-                                process?.Kill();
-                                comm.SendToMaster($"Interrupted:{taskId}");
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            comm.SendToMaster($"Launch failed:{ex.Message}");
-                        }
-                    }
-                }
-                else
-                {
-                    Thread.Sleep(500); // Simulate work
-                }
-
-                Console.WriteLine($"Agent {Id} completed task {taskId}.");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Agent {Id} task {taskId} failed: {ex.Message}");
-                comm.SendToMaster($"Result:{taskId}: Error: {ex.Message}");
-            }
-            finally
-            {
-                lastTaskDuration = DateTime.Now - start;
-                taskQueueLength--;
-                if (taskCancellationTokens.Remove(taskId, out var tok))
-                    tok.Dispose();
-            }
-        }
-
-        // ------------- Heartbeat -------------
-
-        private void SendHeartbeat()
-        {
-            var status = new AgentStatus
+            var cfg = new AgentConfig
             {
                 AgentId = Id,
-                LastHeartbeat = DateTime.Now,
-                IsOnline = true,
-                IpAddress = GetLocalIPAddress() ?? string.Empty,
-
-                CpuUsagePercent = GetCpuLoad(),
-                GpuUsagePercent = GetGpuLoad(),
-                MemoryAvailableMB = GetAvailableMemory(),
-                NetworkMbps = GetNetworkSpeed(),
-
-                HasFileAccess = true,
-                AvailableFiles = GetAvailableFiles(),
-
-                TaskQueueLength = taskQueueLength,
-                LastTaskDuration = lastTaskDuration,
-                DiskReadMBps = GetDiskReadSpeed(),
-                DiskWriteMBps = GetDiskWriteSpeed(),
-
                 CpuLogicalCores = Environment.ProcessorCount,
-
-                HasGpu = TryDetectGpu(out string model, out int memoryMB, out int gpuCount),
-                HasCuda = TryDetectCuda(),
+                RamTotalMB = GetTotalPhysicalRamMB(),
+                HasGpu = TryDetectGpu(out string model, out int memMB, out int gpuCount),
                 GpuModel = model,
-                GpuMemoryMB = memoryMB,
-
-                // Pro/upsell fields
+                GpuMemoryMB = memMB,
                 GpuCount = gpuCount,
+                OsVersion = Environment.OSVersion.ToString(),
                 InstanceId = _instanceId
             };
 
-            string json = status.ToJson();
-            // IMPORTANT: Master expects "AgentStatus:{json}"
-            comm.SendToMaster($"AgentStatus:{json}");
+            var json = JsonSerializer.Serialize(cfg, JsonOpts);
+            comm.SendToMaster($"AgentConfig:{json}");
         }
 
-        // ------------- Hardware helpers -------------
-
-        private bool TryDetectGpu(out string model, out int memoryMB, out int gpuCount)
+        // =====================================================================
+        // Volatile pulse (frequent)
+        // =====================================================================
+        private void SendPulse()
         {
-            model = "No GPU detected";
-            memoryMB = 0;
-            gpuCount = 0;
+            if (!_isRegistered)
+                return; // keep quiet until we're officially registered (keeps noise down)
 
-            try
+            var pulse = new AgentPulse
             {
-                var searcher = new ManagementObjectSearcher("select * from Win32_VideoController");
-                foreach (var obj in searcher.Get())
+                AgentId = Id,
+                CpuUsagePercent = GetCpuLoad(),
+                MemoryAvailableMB = GetAvailableMemory(),
+                GpuUsagePercent = GetGpuLoad(),
+                TaskQueueLength = taskQueueLength,
+                NetworkMbps = GetNetworkSpeed(),
+                DiskReadMBps = 0f,
+                DiskWriteMBps = 0f,
+                LastHeartbeat = DateTime.Now
+            };
+
+            var json = JsonSerializer.Serialize(pulse, JsonOpts);
+            comm.SendToMaster($"AgentPulse:{json}");
+        }
+
+        // =====================================================================
+        // Task execution (toy implementation with cancellation)
+        // =====================================================================
+        private void ExecuteTask(string taskId, string description)
+        {
+            var cts = new CancellationTokenSource();
+            taskCancellationTokens[taskId] = cts;
+            Interlocked.Increment(ref taskQueueLength);
+
+            _ = Task.Run(async () =>
+            {
+                var sw = Stopwatch.StartNew();
+                try
                 {
-                    gpuCount++;
-                    // use the first as “primary” for display
-                    if (gpuCount == 1)
+                    // Simulate short work chunking to make cancellation responsive
+                    for (int i = 0; i < 20; i++)
                     {
-                        model = obj["Name"]?.ToString() ?? "Unknown GPU";
-                        if (obj["AdapterRAM"] != null)
-                        {
-                            var memBytes = Convert.ToInt64(obj["AdapterRAM"]);
-                            memoryMB = (int)(memBytes / (1024 * 1024));
-                        }
+                        cts.Token.ThrowIfCancellationRequested();
+                        await Task.Delay(50, cts.Token);
                     }
+
+                    comm.SendToMaster($"Result:{Id}: Completed task {taskId}: {description}");
                 }
-
-                return gpuCount > 0;
-            }
-            catch
-            {
-                model = "GPU detection failed";
-                memoryMB = 0;
-                gpuCount = 0;
-                return false;
-            }
+                catch (OperationCanceledException)
+                {
+                    comm.SendToMaster($"Result:{Id}: Cancelled task {taskId}");
+                }
+                catch (Exception ex)
+                {
+                    comm.SendToMaster($"Result:{Id}: Error in task {taskId}: {ex.Message}");
+                }
+                finally
+                {
+                    sw.Stop();
+                    lastTaskDuration = sw.Elapsed;
+                    taskCancellationTokens.Remove(taskId);
+                    Interlocked.Decrement(ref taskQueueLength);
+                }
+            }, cts.Token);
         }
 
-        private bool TryDetectCuda()
-        {
-            try
-            {
-                // Stub for Pro version: Check CUDA availability
-                return false;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private float GetCpuLoad()
-        {
-            try
-            {
-                using var counter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
-                counter.NextValue();
-                Thread.Sleep(250);
-                return counter.NextValue();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"GetCpuLoad failed: {ex.Message}");
-                return new Random().Next(10, 90); // Fallback
-            }
-        }
-
-        private float GetGpuLoad()
-        {
-            // Requires GPU-specific library (e.g., NVAPI for NVIDIA) – keep stubbed
-            return new Random().Next(5, 70);
-        }
-
-        private float GetAvailableMemory()
-        {
-            try
-            {
-                using var counter = new PerformanceCounter("Memory", "Available MBytes");
-                return counter.NextValue();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"GetAvailableMemory failed: {ex.Message}");
-                return new Random().Next(1000, 8000); // Fallback
-            }
-        }
-
-        private float GetNetworkSpeed()
-        {
-            // Stub: could measure using NetworkInterface statistics
-            return new Random().Next(10, 500);
-        }
-
-        private float GetDiskReadSpeed()
-        {
-            // Stub: could read from perf counters
-            return new Random().Next(50, 300);
-        }
-
-        private float GetDiskWriteSpeed()
-        {
-            // Stub: could read from perf counters
-            return new Random().Next(40, 250);
-        }
-
-        private string[] GetAvailableFiles()
-        {
-            return new[] { "data1.bin", "log.txt", "config.json" };
-        }
-
+        // =====================================================================
+        // System probes (lightweight)
+        // =====================================================================
         private static string? GetLocalIPAddress()
         {
             try
@@ -383,12 +373,12 @@ namespace NodeAgent
                 foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
                 {
                     if (ni.OperationalStatus != OperationalStatus.Up) continue;
-
-                    var ipProps = ni.GetIPProperties();
-                    foreach (var ua in ipProps.UnicastAddresses)
+                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                    var props = ni.GetIPProperties();
+                    foreach (var ip in props.UnicastAddresses)
                     {
-                        if (ua.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-                            return ua.Address.ToString();
+                        if (ip.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                            return ip.Address.ToString();
                     }
                 }
             }
@@ -396,16 +386,89 @@ namespace NodeAgent
             return null;
         }
 
-        public void Dispose()
+        private static float GetCpuLoad()
         {
-            try { heartbeatTimer?.Stop(); } catch { /* ignore */ }
-            try { heartbeatTimer?.Dispose(); } catch { /* ignore */ }
+            // TODO: port MainWindow's accurate CPU sampling to NodeAgent for parity.
+            try
+            {
+                return (float)Math.Max(0, Math.Min(100, new Random().Next(10, 40))); // placeholder sample
+            }
+            catch { return 0f; }
+        }
 
-            foreach (var kvp in taskCancellationTokens)
-                kvp.Value.Cancel();
-            taskCancellationTokens.Clear();
+        private static float GetGpuLoad()
+        {
+            // TODO: port GPU Engine counter sampling if desired. Keep light for now.
+            try { return 0f; } catch { return 0f; }
+        }
+
+        private static float GetAvailableMemory()
+        {
+            try
+            {
+                // TODO: implement a real available memory probe; keep simple for now.
+                return 0f;
+            }
+            catch { return 0f; }
+        }
+
+        private static float GetNetworkSpeed() => 0f;
+
+        private static bool TryDetectGpu(out string model, out int memMB, out int gpuCount)
+        {
+            model = string.Empty;
+            memMB = 0;
+            gpuCount = 0;
+            try
+            {
+                using var s = new ManagementObjectSearcher("SELECT Name, AdapterRAM, PNPDeviceID FROM Win32_VideoController");
+                foreach (ManagementObject mo in s.Get())
+                {
+                    string name = mo["Name"]?.ToString() ?? "";
+                    string pnp = mo["PNPDeviceID"]?.ToString() ?? "";
+                    if (pnp.IndexOf("PCI", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    if (name.IndexOf("Microsoft Basic Display", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+
+                    long bytes = 0;
+                    var ramObj = mo["AdapterRAM"];
+                    if (ramObj != null) { try { bytes = Convert.ToInt64(ramObj); } catch { bytes = 0; } }
+
+                    gpuCount++;
+                    if (string.IsNullOrEmpty(model)) model = name;
+                    if (memMB == 0 && bytes > 0) memMB = (int)Math.Round(bytes / (1024.0 * 1024.0));
+                }
+
+                return gpuCount > 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static float GetTotalPhysicalRamMB()
+        {
+            try
+            {
+                // Avoid Microsoft.VisualBasic dependency; use WMI.
+                using var cs = new ManagementObjectSearcher("SELECT TotalVisibleMemorySize FROM Win32_OperatingSystem");
+                foreach (ManagementObject mo in cs.Get())
+                {
+                    if (mo["TotalVisibleMemorySize"] != null)
+                    {
+                        // value is in KB
+                        double kb = Convert.ToDouble(mo["TotalVisibleMemorySize"]);
+                        return (float)(kb / 1024.0);
+                    }
+                }
+            }
+            catch { }
+            return 0f;
         }
     }
 }
+
+
+
 
 

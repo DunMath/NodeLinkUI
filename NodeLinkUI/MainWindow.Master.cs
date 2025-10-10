@@ -1,4 +1,5 @@
-﻿using NodeComm;
+﻿// File: NodeLinkUI/MainWindow.Master.cs  (AMENDED for ObservableCollection + in-place updates)
+using NodeComm;
 using NodeCore;
 using NodeCore.Scheduling;
 using NodeMaster;
@@ -16,170 +17,236 @@ namespace NodeLinkUI
 {
     public partial class MainWindow : Window
     {
-             
+        // DTO used for state save/load
+        private sealed class UiState
+        {
+            public List<AgentStatus>? AgentStatuses { get; set; }
+            public List<string>? TaskHistory { get; set; }
+            public NodeRole CurrentRole { get; set; }
+        }
 
+        /// <summary>
+        /// Pulls statuses from NodeMaster and merges them into the bound ObservableCollection.
+        /// </summary>
         private void RefreshAgentStatuses()
         {
             if (master is null) return;
 
-            agentStatuses = master.GetAgentStatuses();
-            NodeGrid.ItemsSource = agentStatuses;
+            var list = master.GetAgentStatuses(); // List<AgentStatus>
+
+            // Merge in place — no rebinds; preserves selection & row colors.
+            foreach (var s in list)
+            {
+                // Also mark presence "seen" now so presence-smoothing is happier.
+                _lastSeenUtc[s.AgentId] = DateTime.UtcNow;
+                UpdateOrAddAgentStatus(s);
+            }
+
+            // Optionally log GPU info
+            foreach (var status in agentStatuses)
+            {
+                if (status.AgentId.Equals("Master", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (status.HasGpu)
+                    Log($"{status.AgentId} GPU: {status.GpuModel} ({status.GpuMemoryMB}MB)");
+                else
+                    Log($"{status.AgentId} has no GPU");
+            }
+
+            RefreshGridPreservingSelection();
+        }
+
+        /// <summary>
+        /// Adds basic alerts and offline detection. Uses in-place updates and one refresh.
+        /// </summary>
+        private void MonitorAgentStatus()
+        {
+            if (currentRole != NodeRole.Master) return;
 
             foreach (var status in agentStatuses)
             {
-                if (status.HasGpu)
+                if ((DateTime.Now - status.LastHeartbeat).TotalSeconds > 10)
                 {
-                    LogBox.Items.Add($"{status.AgentId} GPU: {status.GpuModel} ({status.GpuMemoryMB}MB)");
+                    status.IsOnline = false;
+                    Log($"Agent {status.AgentId} is offline");
+                    AlertBox.Items.Add($"Agent {status.AgentId} offline");
                 }
-                else
-                {
-                    LogBox.Items.Add($"{status.AgentId} has no GPU");
-                }
-            }
-        }
 
-        private void MonitorAgentStatus()
-        {
-            if (currentRole == NodeRole.Master)
-            {
-                foreach (var status in agentStatuses)
-                {
-                    if ((DateTime.Now - status.LastHeartbeat).TotalSeconds > 10)
-                    {
-                        status.IsOnline = false;
-                        LogBox.Items.Add($"Agent {status.AgentId} is offline");
-                        AlertBox.Items.Add($"Agent {status.AgentId} offline");
-                    }
-                    if (status.CpuUsagePercent > 90)
-                    {
-                        AlertBox.Items.Add($"High CPU usage on {status.AgentId}: {status.CpuUsagePercent}%");
-                    }
-                    if (status.GpuUsagePercent > 90 && status.HasGpu)
-                    {
-                        AlertBox.Items.Add($"High GPU usage on {status.AgentId}: {status.GpuUsagePercent}%");
-                    }
-                }
-                NodeGrid.Items.Refresh();
+                if (status.CpuUsagePercent > 90)
+                    AlertBox.Items.Add($"High CPU usage on {status.AgentId}: {status.CpuUsagePercent:F0}%");
+
+                if (status.HasGpu && status.GpuUsagePercent > 90)
+                    AlertBox.Items.Add($"High GPU usage on {status.AgentId}: {status.GpuUsagePercent:F0}%");
             }
+
+            RefreshGridPreservingSelection();
         }
 
         private void SaveState_Click(object sender, RoutedEventArgs e)
         {
-            if (currentRole == NodeRole.Master)
+            if (currentRole != NodeRole.Master)
             {
-                File.WriteAllText("state.json", JsonSerializer.Serialize(new
+                Log("State saving only available in Master mode");
+                return;
+            }
+
+            try
+            {
+                var state = new UiState
                 {
-                    AgentStatuses = agentStatuses,
+                    AgentStatuses = agentStatuses.ToList(),
                     TaskHistory = taskHistory,
                     CurrentRole = currentRole
-                }));
-                LogBox.Items.Add("State saved to state.json");
+                };
+                File.WriteAllText("state.json", JsonSerializer.Serialize(state, new JsonSerializerOptions { WriteIndented = true }));
+                Log("State saved to state.json");
             }
-            else
+            catch (Exception ex)
             {
-                LogBox.Items.Add("State saving only available in Master mode");
+                Log($"Failed to save state: {ex.Message}");
             }
         }
 
         private void LoadState_Click(object sender, RoutedEventArgs e)
         {
-            if (currentRole == NodeRole.Master && File.Exists("state.json"))
+            if (currentRole != NodeRole.Master)
             {
-                var state = JsonSerializer.Deserialize<Dictionary<string, object>>(File.ReadAllText("state.json"));
-                if (state.ContainsKey("AgentStatuses"))
-                {
-                    agentStatuses = JsonSerializer.Deserialize<List<AgentStatus>>(state["AgentStatuses"].ToString());
-                    NodeGrid.ItemsSource = agentStatuses;
-                    NodeGrid.Items.Refresh();
-                }
-                if (state.ContainsKey("TaskHistory"))
-                {
-                    taskHistory = JsonSerializer.Deserialize<List<string>>(state["TaskHistory"].ToString());
-                    TaskListBox.ItemsSource = taskHistory;
-                    TaskListBox.Items.Refresh();
-                    TaskCountLabel.Text = taskHistory.Count.ToString();
-                }
-                LogBox.Items.Add("State loaded from state.json");
+                Log("State loading only available in Master mode");
+                return;
             }
-            else
+
+            if (!File.Exists("state.json"))
             {
-                LogBox.Items.Add("No state file found or not in Master mode");
+                Log("No state.json file found");
+                return;
+            }
+
+            try
+            {
+                var state = JsonSerializer.Deserialize<UiState>(File.ReadAllText("state.json"));
+                if (state != null)
+                {
+                    if (state.AgentStatuses != null)
+                    {
+                        // Replace contents, not the collection
+                        agentStatuses.Clear();
+                        foreach (var s in state.AgentStatuses)
+                        {
+                            _lastSeenUtc[s.AgentId] = DateTime.UtcNow;
+                            agentStatuses.Add(s);
+                        }
+                        RefreshGridPreservingSelection();
+                    }
+
+                    if (state.TaskHistory != null)
+                    {
+                        taskHistory = state.TaskHistory;
+                        // We keep TaskListBox bound to 'tasks' (TaskInfo) in the main app.
+                        // Here we just reflect a count if you show one.
+                        try { TaskCountLabel.Text = tasks.Count.ToString(); } catch { }
+                    }
+
+                    Log("State loaded from state.json");
+                }
+                else
+                {
+                    Log("State file was empty or invalid");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"Failed to load state: {ex.Message}");
             }
         }
 
         private void ClearLog_Click(object sender, RoutedEventArgs e)
         {
             LogBox.Items.Clear();
-            LogBox.Items.Add("Log cleared");
+            Log("Log cleared");
         }
 
         private void ClearAlerts_Click(object sender, RoutedEventArgs e)
         {
             AlertBox.Items.Clear();
-            LogBox.Items.Add("Alerts cleared");
+            Log("Alerts cleared");
         }
 
         private void RefreshAgents_Click(object sender, RoutedEventArgs e)
         {
-            if (currentRole == NodeRole.Master)
+            if (currentRole != NodeRole.Master)
             {
-                RefreshAgentStatuses();
-                MonitorAgentStatus();
-                LogBox.Items.Add("Agent statuses refreshed");
+                Log("Agent refresh only available in Master mode");
+                return;
             }
-            else
-            {
-                LogBox.Items.Add("Agent refresh only available in Master mode");
-            }
+
+            RefreshAgentStatuses();
+            MonitorAgentStatus();
+            Log("Agent statuses refreshed");
         }
 
         private void RemoveAgent_Click(object sender, RoutedEventArgs e)
         {
-            if (currentRole == NodeRole.Master && NodeGrid.SelectedItem is AgentStatus selectedAgent)
+            if (currentRole != NodeRole.Master)
+            {
+                Log("Select an agent to remove in Master mode");
+                return;
+            }
+
+            if (NodeGrid.SelectedItem is AgentStatus selectedAgent)
             {
                 agentStatuses.Remove(selectedAgent);
-                NodeGrid.Items.Refresh();
-                LogBox.Items.Add($"Removed agent {selectedAgent.AgentId}");
+                RefreshGridPreservingSelection();
+                Log($"Removed agent {selectedAgent.AgentId}");
             }
             else
             {
-                LogBox.Items.Add("Select an agent to remove in Master mode");
+                Log("Select an agent row first");
             }
         }
 
         private void StopTask_Click(object sender, RoutedEventArgs e)
         {
-            if (currentRole == NodeRole.Master && TaskListBox.SelectedItem is string taskPayload)
+            if (currentRole != NodeRole.Master)
             {
-                var parts = taskPayload.Split(':');
-                if (parts.Length >= 3)
-                {
-                    string taskId = parts[1];
-                    string agentId = parts.Last();
+                Log("Stop Task is only available in Master mode");
+                return;
+            }
+
+            // Your XAML binds TaskListBox to TaskInfo items (not strings).
+            if (TaskListBox.SelectedItem is TaskInfo selected)
+            {
+                var taskId = selected.TaskId;
+                var agentId = selected.AgentId;
+
+                // Prefer NodeMaster path; fallback to CommChannel direct
+                if (master != null)
+                    master.DispatchTaskToAgent($"StopTask:{taskId}", agentId);
+                else
                     comm.SendToAgent(agentId, $"StopTask:{taskId}");
-                    taskHistory.Remove(taskPayload);
-                    TaskListBox.Items.Refresh();
-                    TaskCountLabel.Text = taskHistory.Count.ToString();
-                    LogBox.Items.Add($"Requested to stop task {taskId} on {agentId}");
-                }
+
+                tasks.Remove(selected);
+                try { TaskCountLabel.Text = tasks.Count.ToString(); } catch { }
+
+                Log($"Requested to stop task {taskId} on {agentId}");
             }
             else
             {
-                LogBox.Items.Add("Select a task to stop in Master mode");
+                Log("Select a task to stop");
             }
         }
 
         private void UpdateSchedulerSettings_Click(object sender, RoutedEventArgs e)
         {
-            if (currentRole == NodeRole.Master)
+            if (currentRole != NodeRole.Master)
             {
-                scheduler.SetMode(SchedulerMode.Auto); // Example: Update as needed
-                LogBox.Items.Add("Scheduler settings updated to Balanced mode");
+                Log("Scheduler settings only available in Master mode");
+                return;
             }
-            else
-            {
-                LogBox.Items.Add("Scheduler settings only available in Master mode");
-            }
+
+            scheduler?.SetMode(SchedulerMode.Auto); // as needed
+            Log("Scheduler settings updated to Auto mode");
         }
     }
 }
+

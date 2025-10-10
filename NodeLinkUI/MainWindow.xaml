@@ -39,11 +39,9 @@
             <RowDefinition Height="Auto"/>
             <!-- Row 1: Controls -->
             <RowDefinition Height="3*"/>
-            <!-- Row 2: Nodes (full width, tall) -->
-            <RowDefinition Height="1.2*"/>
-            <!-- Row 3: Alerts (Tasks hidden) -->
-            <RowDefinition Height="1.3*"/>
-            <!-- Row 4: Log -->
+            <!-- Row 2: Nodes (tall) -->
+            <RowDefinition Height="2.4*"/>
+            <!-- Row 3: Alerts + Log side-by-side (taller shared row) -->
         </Grid.RowDefinitions>
 
         <!-- Row 0: Header / Status -->
@@ -102,8 +100,9 @@
                 <Button x:Name="DispatchTaskButton" Content="Dispatch" Click="DispatchTask_Click"/>
                 <Button x:Name="StopAllTasksButton" Content="Stop All" Click="StopAllTasksButton_Click"/>
                 <Button x:Name="BroadcastButton" Content="Broadcast" Click="Broadcast_Click"/>
+                <Button x:Name="UpdateAgentConfigButton" Content="Update Agent Config" Click="UpdateAgentConfig_Click"/>
 
-                <!-- NEW: Compute Test button -->
+                <!-- Compute Test button -->
                 <Button x:Name="ComputeTestButton" Content="Compute Test" Click="ComputeTest_Click"/>
             </StackPanel>
 
@@ -113,16 +112,16 @@
                 <Button x:Name="CustomTaskButton" Content="Send Task" Click="CustomTaskButton_Click"/>
             </StackPanel>
 
-            <!-- Right hamburger dropdown (Account, Settings, Switch Role, Help, About, Save & Exit) -->
+            <!-- Right hamburger dropdown (Account, Settings, Help, About, Open Logs, Save & Exit) -->
             <Menu Grid.Column="2" HorizontalAlignment="Right" VerticalAlignment="Center">
                 <MenuItem Header="☰" FontSize="20" Padding="8,2">
                     <MenuItem Header="Account" IsEnabled="False"/>
                     <Separator/>
                     <MenuItem Header="Settings" Click="SettingsButton_Click"/>
-                    <MenuItem Header="Switch Role" Click="SwitchRole_Click"/>
                     <Separator/>
                     <MenuItem Header="Help" Click="HelpMenu_Click"/>
                     <MenuItem Header="About" Click="AboutMenu_Click"/>
+                    <MenuItem Header="Open Logs" Click="OpenLogsMenu_Click"/>
                     <Separator/>
                     <MenuItem Header="Save &amp; Exit" Click="ExitButton_Click"/>
                 </MenuItem>
@@ -141,8 +140,61 @@
                       CanUserDeleteRows="False"
                       GridLinesVisibility="None"
                       RowHeight="32"
-                      MinHeight="240">
-                <!-- ~6 rows visible incl. header -->
+                      MinHeight="240"
+                      SelectionUnit="FullRow"
+                      SelectionMode="Single">
+
+                <!-- 4-colour row styling -->
+                <DataGrid.RowStyle>
+                    <Style TargetType="DataGridRow">
+                        <Setter Property="SnapsToDevicePixels" Value="True"/>
+                        <Setter Property="Background" Value="{x:Static SystemColors.ControlBrush}"/>
+
+                        <Style.Triggers>
+                            <!-- Discovered (not registered yet) => amber -->
+                            <DataTrigger Binding="{Binding Registered}" Value="False">
+                                <Setter Property="Background" Value="#FFF8E1"/>
+                            </DataTrigger>
+
+                            <!-- Registered + Offline => soft red -->
+                            <MultiDataTrigger>
+                                <MultiDataTrigger.Conditions>
+                                    <Condition Binding="{Binding Registered}" Value="True"/>
+                                    <Condition Binding="{Binding IsOnline}"   Value="False"/>
+                                </MultiDataTrigger.Conditions>
+                                <Setter Property="Background" Value="#FCE8E6"/>
+                            </MultiDataTrigger>
+
+                            <!-- Registered + Online + Degraded => soft yellow -->
+                            <MultiDataTrigger>
+                                <MultiDataTrigger.Conditions>
+                                    <Condition Binding="{Binding Registered}" Value="True"/>
+                                    <Condition Binding="{Binding IsOnline}"   Value="True"/>
+                                    <Condition Binding="{Binding IsDegraded}" Value="True"/>
+                                </MultiDataTrigger.Conditions>
+                                <Setter Property="Background" Value="#FFF3CD"/>
+                            </MultiDataTrigger>
+
+                            <!-- Registered + Online (healthy) => soft green -->
+                            <MultiDataTrigger>
+                                <MultiDataTrigger.Conditions>
+                                    <Condition Binding="{Binding Registered}" Value="True"/>
+                                    <Condition Binding="{Binding IsOnline}"   Value="True"/>
+                                    <Condition Binding="{Binding IsDegraded}" Value="False"/>
+                                </MultiDataTrigger.Conditions>
+                                <Setter Property="Background" Value="#E5F6E8"/>
+                            </MultiDataTrigger>
+
+                            <!-- Selection overlay (keep readable) -->
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter Property="BorderBrush" Value="#666"/>
+                                <Setter Property="BorderThickness" Value="1"/>
+                                <Setter Property="Background" Value="#CCE5FF"/>
+                            </Trigger>
+                        </Style.Triggers>
+                    </Style>
+                </DataGrid.RowStyle>
+
                 <DataGrid.Columns>
                     <!-- Identity -->
                     <DataGridTextColumn Header="ID" Binding="{Binding AgentId}" Width="200"/>
@@ -152,8 +204,8 @@
                     <DataGridTextColumn Header="CPU %" Binding="{Binding CpuUsagePercent, StringFormat={}{0:F0}}" Width="70"/>
                     <DataGridTextColumn Header="Mem Avail (MB)" Binding="{Binding MemoryAvailableMB, StringFormat={}{0:F0}}" Width="120"/>
 
-                    <!-- GPU: Yes/No via triggers (no converter needed) -->
-                    <DataGridTextColumn Header="GPU?" Width="60">
+                    <!-- GPU? column collapsed (kept for future) -->
+                    <DataGridTextColumn Header="GPU?" Width="60" Visibility="Collapsed">
                         <DataGridTextColumn.ElementStyle>
                             <Style TargetType="TextBlock">
                                 <Setter Property="Text" Value="{Binding HasGpu}"/>
@@ -195,7 +247,7 @@
                         </DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
 
-                    <!-- NEW: Self-test status (✓ / ✗ / …) -->
+                    <!-- Self-test status (✓ / ✗ / …) -->
                     <DataGridTextColumn Header="Test" Width="60" Binding="{Binding SelfTestStatus}">
                         <DataGridTextColumn.ElementStyle>
                             <Style TargetType="TextBlock">
@@ -217,19 +269,18 @@
                             </Style>
                         </DataGridTextColumn.ElementStyle>
                     </DataGridTextColumn>
-
                 </DataGrid.Columns>
             </DataGrid>
         </GroupBox>
 
-        <!-- Row 3: Alerts (Tasks hidden but kept for code-behind safety) -->
+        <!-- Row 3: Alerts + Log side-by-side (twice height, half width each) -->
         <Grid Grid.Row="3" Margin="0,8,0,0">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
 
-            <!-- Keep Tasks UI but collapse it so code-behind references remain valid -->
+            <!-- Keep Tasks (hidden) so code-behind references remain valid -->
             <GroupBox Header="Tasks" Margin="0,0,8,0" Visibility="Collapsed">
                 <ListBox x:Name="TaskListBox">
                     <ListBox.ItemTemplate>
@@ -256,18 +307,23 @@
                 </ListBox>
             </GroupBox>
 
-            <!-- Alerts take full width -->
-            <GroupBox Header="Alerts" Grid.ColumnSpan="2">
+            <!-- Left: Alerts -->
+            <GroupBox Header="Alerts" Grid.Column="0" Margin="0,0,8,0">
                 <ListBox x:Name="AlertBox"/>
             </GroupBox>
-        </Grid>
 
-        <!-- Row 4: Log -->
-        <GroupBox Grid.Row="4" Header="Log" Margin="0,8,0,0">
-            <ListBox x:Name="LogBox"/>
-        </GroupBox>
+            <!-- Right: Log -->
+            <GroupBox Header="Log" Grid.Column="1">
+                <ListBox x:Name="LogBox"/>
+            </GroupBox>
+        </Grid>
     </Grid>
 </Window>
+
+
+
+
+
 
 
 

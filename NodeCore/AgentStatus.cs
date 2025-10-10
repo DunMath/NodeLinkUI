@@ -49,6 +49,13 @@ namespace NodeCore
         [JsonIgnore]
         public string SelfTestStatus { get; set; } = string.Empty;
 
+        // NEW: row-colour state — becomes true after RegisterAck or AgentConfig on Master
+        public bool Registered { get; set; } = false;
+
+        // NEW: derived UI flag for “yellow” state (don’t serialize)
+        [JsonIgnore]
+        public bool IsDegraded { get; set; } = false;
+
         // Serialize to JSON (excludes [JsonIgnore] fields)
         public string ToJson() => JsonSerializer.Serialize(this);
 
@@ -57,6 +64,7 @@ namespace NodeCore
             => JsonSerializer.Deserialize<AgentStatus>(json) ?? new AgentStatus();
     }
 }
+
 
 
 
