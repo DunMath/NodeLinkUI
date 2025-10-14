@@ -1,69 +1,189 @@
-﻿using System;
+﻿// NodeCore/AgentStatus.cs — v2.0
+// Rich agent model with presence, sticky IP/MAC, latency tracking, and JSON helpers.
+
+using System;
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 
 namespace NodeCore
 {
-    public class AgentStatus
+    public sealed class AgentStatus : INotifyPropertyChanged
     {
-        public string AgentId { get; set; } = "";
-        public DateTime LastHeartbeat { get; set; }
-        public bool IsOnline { get; set; }
-        public string IpAddress { get; set; } = ""; // For NodeGrid
+        // Identity / addressing
+        private string _agentId = "";
+        public string AgentId { get => _agentId; set => Set(ref _agentId, value); }
 
-        public float CpuUsagePercent { get; set; }
-        public float GpuUsagePercent { get; set; }
-        public float MemoryAvailableMB { get; set; }
-        public float NetworkMbps { get; set; }
+        private string _ipAddress = "";
+        public string IpAddress { get => _ipAddress; set => Set(ref _ipAddress, value); }
 
-        public bool HasFileAccess { get; set; }
-        public string[] AvailableFiles { get; set; } = Array.Empty<string>();
+        // Sticky addressing for DHCP-lite
+        private string _stickyIp = "";
+        public string StickyIp { get => _stickyIp; set => Set(ref _stickyIp, value); }
 
-        // Performance metrics for scheduling
-        public int TaskQueueLength { get; set; }
-        public TimeSpan LastTaskDuration { get; set; }
-        public float DiskReadMBps { get; set; }
-        public float DiskWriteMBps { get; set; }
+        private string _mac = "";
+        public string Mac { get => _mac; set => Set(ref _mac, value); }
 
-        // SoftThreads capacity input (Agents should set to Environment.ProcessorCount)
-        public int CpuLogicalCores { get; set; } = 0;
+        // Registration / health
+        private bool _registered;
+        public bool Registered { get => _registered; set => Set(ref _registered, value); }
 
-        // Quick load check
-        public bool IsBusy => TaskQueueLength > 0 || CpuUsagePercent > 85 || GpuUsagePercent > 85;
+        private bool _isOnline;
+        public bool IsOnline { get => _isOnline; set => Set(ref _isOnline, value); }
 
-        // GPU capability reporting (single GPU in v1)
-        public bool HasGpu { get; set; }
-        public bool HasCuda { get; set; }
-        public string GpuModel { get; set; } = "";
-        public int GpuMemoryMB { get; set; }
+        private bool _isDegraded;
+        public bool IsDegraded { get => _isDegraded; set => Set(ref _isDegraded, value); }
 
-        // For Pro upsell (Agent restarts + multi-GPU detection)
-        public int GpuCount { get; set; } = 0;        // number of GPUs on the node
-        public string InstanceId { get; set; } = "";  // unique per NodeLinkUI process run (GUID recommended)
+        // Presence timeline
+        private DateTime _lastHeartbeat;
+        public DateTime LastHeartbeat { get => _lastHeartbeat; set => Set(ref _lastHeartbeat, value); }
 
-        // Master-only display: cached soft threads (not serialized)
-        [JsonIgnore]
-        public int SoftThreadsQueued { get; set; } = 0;
+        // Public set so Bootstrapper and UI can maintain it
+        private DateTime _lastSeen = DateTime.MinValue;
+        public DateTime LastSeen { get => _lastSeen; set => Set(ref _lastSeen, value); }
 
-        // Compute test UI indicator (… / ✓ / ✗) – not serialized
-        [JsonIgnore]
-        public string SelfTestStatus { get; set; } = string.Empty;
+        // Volatile (pulse) metrics
+        private float _cpuUsagePercent;
+        public float CpuUsagePercent { get => _cpuUsagePercent; set => Set(ref _cpuUsagePercent, value); }
 
-        // NEW: row-colour state — becomes true after RegisterAck or AgentConfig on Master
-        public bool Registered { get; set; } = false;
+        private float _memoryAvailableMB;
+        public float MemoryAvailableMB { get => _memoryAvailableMB; set => Set(ref _memoryAvailableMB, value); }
 
-        // NEW: derived UI flag for “yellow” state (don’t serialize)
-        [JsonIgnore]
-        public bool IsDegraded { get; set; } = false;
+        private float _gpuUsagePercent;
+        public float GpuUsagePercent { get => _gpuUsagePercent; set => Set(ref _gpuUsagePercent, value); }
 
-        // Serialize to JSON (excludes [JsonIgnore] fields)
-        public string ToJson() => JsonSerializer.Serialize(this);
+        private int _taskQueueLength;
+        public int TaskQueueLength { get => _taskQueueLength; set => Set(ref _taskQueueLength, value); }
 
-        // Deserialize from JSON
-        public static AgentStatus FromJson(string json)
-            => JsonSerializer.Deserialize<AgentStatus>(json) ?? new AgentStatus();
+        private float _networkMbps;
+        public float NetworkMbps { get => _networkMbps; set => Set(ref _networkMbps, value); }
+
+        private float _diskReadMBps;
+        public float DiskReadMBps { get => _diskReadMBps; set => Set(ref _diskReadMBps, value); }
+
+        private float _diskWriteMBps;
+        public float DiskWriteMBps { get => _diskWriteMBps; set => Set(ref _diskWriteMBps, value); }
+
+        // Static machine capabilities
+        private int _cpuLogicalCores;
+        public int CpuLogicalCores { get => _cpuLogicalCores; set => Set(ref _cpuLogicalCores, value); }
+
+        private bool _hasGpu;
+        public bool HasGpu { get => _hasGpu; set => Set(ref _hasGpu, value); }
+
+        private bool _hasCuda;
+        public bool HasCuda { get => _hasCuda; set => Set(ref _hasCuda, value); }
+
+        private string _gpuModel = "";
+        public string GpuModel { get => _gpuModel; set => Set(ref _gpuModel, value); }
+
+        private int _gpuMemoryMB;
+        public int GpuMemoryMB { get => _gpuMemoryMB; set => Set(ref _gpuMemoryMB, value); }
+
+        private int _gpuCount;
+        public int GpuCount { get => _gpuCount; set => Set(ref _gpuCount, value); }
+
+        private string _instanceId = "";
+        public string InstanceId { get => _instanceId; set => Set(ref _instanceId, value); }
+
+        // File access (optional)
+        private bool _hasFileAccess;
+        public bool HasFileAccess { get => _hasFileAccess; set => Set(ref _hasFileAccess, value); }
+
+        private string[] _availableFiles = Array.Empty<string>();
+        public string[] AvailableFiles { get => _availableFiles; set => Set(ref _availableFiles, value); }
+
+        // Self-test and recency of compute
+        private string _selfTestStatus = "";   // "✓", "✗", or "…"
+        public string SelfTestStatus { get => _selfTestStatus; set => Set(ref _selfTestStatus, value); }
+
+        private string _lastComputeResult = "";
+        public string LastComputeResult { get => _lastComputeResult; set => Set(ref _lastComputeResult, value); }
+
+        private DateTime _lastComputeAt;
+        public DateTime LastComputeAt { get => _lastComputeAt; set => Set(ref _lastComputeAt, value); }
+
+        private TimeSpan _lastTaskDuration = TimeSpan.Zero;
+        public TimeSpan LastTaskDuration { get => _lastTaskDuration; set => Set(ref _lastTaskDuration, value); }
+
+        // UI-only aggregation (bound in XAML)
+        private int _softThreadsQueued;
+        public int SoftThreadsQueued { get => _softThreadsQueued; set => Set(ref _softThreadsQueued, value); }
+
+        // Latency tracking
+        private double _lastLatencyMs;
+        public double LastLatencyMs { get => _lastLatencyMs; set => Set(ref _lastLatencyMs, value); }
+
+        private double _avgLatencyMs;
+        public double AvgLatencyMs { get => _avgLatencyMs; set => Set(ref _avgLatencyMs, value); }
+
+        private int _samples;
+        public int Samples { get => _samples; set => Set(ref _samples, value); }
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+
+        private void OnPropertyChanged([CallerMemberName] string? prop = null)
+            => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(prop));
+
+        private bool Set<T>(ref T field, T value, [CallerMemberName] string? prop = null)
+        {
+            if (Equals(field, value)) return false;
+            field = value;
+            OnPropertyChanged(prop);
+            return true;
+        }
+
+        // --- Helpers ---
+
+        /// <summary>Update latency with a simple running average (or EMA if alpha provided).</summary>
+        public void UpdateLatency(double ms, double? alpha = null)
+        {
+            LastLatencyMs = ms;
+            if (Samples <= 0) { AvgLatencyMs = ms; Samples = 1; return; }
+
+            if (alpha is double a && a > 0 && a <= 1)
+                AvgLatencyMs = (a * ms) + ((1 - a) * AvgLatencyMs);
+            else
+                AvgLatencyMs = ((AvgLatencyMs * Samples) + ms) / (Samples + 1);
+
+            Samples++;
+        }
+        // NEW: computed busy flag the scheduler can read
+        public bool IsBusy
+        {
+            get
+            {
+                // Busy if it currently has tasks queued, or it's mid self-test right after registration.
+                // Tweak the logic to match your semantics.
+                if (TaskQueueLength > 0) return true;
+                if (Registered && SelfTestStatus == "…") return true;
+                return false;
+            }
+        }
+
+        // JSON helpers (so Bootstrapper/UI can share a common format)
+
+        public string ToJson(JsonSerializerOptions? options = null)
+            => JsonSerializer.Serialize(this, options ?? DefaultJsonOptions);
+
+        public static AgentStatus FromJson(string json, string? ip = null, string? mac = null)
+        {
+            var model = JsonSerializer.Deserialize<AgentStatus>(json, DefaultJsonOptions) ?? new AgentStatus();
+            if (!string.IsNullOrWhiteSpace(ip)) model.IpAddress = ip!;
+            if (!string.IsNullOrWhiteSpace(mac)) model.Mac = mac!;
+            return model;
+        }
+
+        public static readonly JsonSerializerOptions DefaultJsonOptions = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            WriteIndented = false
+        };
     }
 }
+
+
+
 
 
 

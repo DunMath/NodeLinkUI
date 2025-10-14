@@ -8,7 +8,7 @@ using System.Windows;
 
 using NodeCore;                  // AgentStatus (typed)
 using NodeCore.Config;           // NodeLinkConfig.Load()
-using NodeMaster.Bootstrap;      // MasterBootstrapper.Initialize(...)
+using NodeMaster;      // MasterBootstrapper.Initialize(...)
 
 namespace NodeLinkUI
 {

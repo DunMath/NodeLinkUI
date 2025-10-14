@@ -8,14 +8,17 @@
 		<UseWPF>true</UseWPF>
 	</PropertyGroup>
 
+	<!-- Remove any NodeLink.config.json that flows in from referenced projects/subfolders -->
 	<ItemGroup>
-	  <None Remove="NodeLink.config.json" />
+		<None Remove="**/NodeLink.config.json" />
 	</ItemGroup>
 
+	<!-- Re-include ONLY this project's own config and publish it -->
 	<ItemGroup>
-	  <Content Include="NodeLink.config.json">
-	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-	  </Content>
+		<None Include="NodeLink.config.json">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+			<CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+		</None>
 	</ItemGroup>
 
 	<ItemGroup>
@@ -31,7 +34,20 @@
 		<ProjectReference Include="..\NodeComm\NodeComm.csproj" />
 		<ProjectReference Include="..\NodeCore\NodeCore.csproj" />
 		<ProjectReference Include="..\NodeMaster\NodeMaster.csproj" />
-	
 	</ItemGroup>
 
+	<ItemGroup>
+	  <Resource Include="Assets\NodeSupervisor.png">
+	    <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+	  </Resource>
+	</ItemGroup>
+
+	<!-- Optional belt-and-braces: drop any stray NodeLink.config.json not originating in this project -->
+	<Target Name="DedupNodeLinkConfig" BeforeTargets="ResolvePublishFiles">
+		<ItemGroup>
+			<ResolvedFileToPublish Remove="@(ResolvedFileToPublish)" Condition="$([System.StringComparer]::OrdinalIgnoreCase.Equals('%(ResolvedFileToPublish.RelativePath)','NodeLink.config.json')) &#xD;&#xA;                   AND ! $([System.StringComparer]::OrdinalIgnoreCase.Equals('%(ResolvedFileToPublish.OriginalItemSpec)','NodeLink.config.json'))" />
+		</ItemGroup>
+	</Target>
+
 </Project>
+

@@ -1,31 +1,33 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
-  <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-  </PropertyGroup>
+	<PropertyGroup>
+		<TargetFramework>net8.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+	</PropertyGroup>
 
-  <ItemGroup>
-    <None Remove="NodeLink.config.json" />
-  </ItemGroup>
+	<!-- Keep NodeMaster's config for its own bin/, but NEVER publish it to parent projects -->
+	<ItemGroup>
+		<!-- Ensure it's not implicitly included as None -->
+		<None Remove="NodeLink.config.json" />
+		<!-- Treat as Content for this project, but never copy to publish -->
+		<Content Include="NodeLink.config.json">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+			<CopyToPublishDirectory>Never</CopyToPublishDirectory>
+		</Content>
+	</ItemGroup>
 
-  <ItemGroup>
-    <Content Include="NodeLink.config.json">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </Content>
-  </ItemGroup>
+	<ItemGroup>
+		<PackageReference Include="Makaretu.Dns" Version="2.0.1" />
+		<PackageReference Include="Makaretu.Dns.Multicast" Version="0.27.0" />
+		<PackageReference Include="System.Management" Version="9.0.9" />
+	</ItemGroup>
 
-  <ItemGroup>
-    <PackageReference Include="Makaretu.Dns" Version="2.0.1" />
-    <PackageReference Include="Makaretu.Dns.Multicast" Version="0.27.0" />
-    <PackageReference Include="System.Management" Version="9.0.9" />
-  </ItemGroup>
- 
-  <ItemGroup>
-    <ProjectReference Include="..\NodeAgent\NodeAgent.csproj" />
-    <ProjectReference Include="..\NodeComm\NodeComm.csproj" />
-	<ProjectReference Include="..\NodeCore\NodeCore.csproj" />
-  </ItemGroup>
+	<ItemGroup>
+		<ProjectReference Include="..\NodeAgent\NodeAgent.csproj" />
+		<ProjectReference Include="..\NodeComm\NodeComm.csproj" />
+		<ProjectReference Include="..\NodeCore\NodeCore.csproj" />
+	</ItemGroup>
 
 </Project>
+

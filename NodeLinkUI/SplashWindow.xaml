@@ -30,7 +30,7 @@
 
             <!-- Center branding -->
             <StackPanel Grid.Row="0" VerticalAlignment="Center" HorizontalAlignment="Center">
-                <TextBlock Text="NODE MANAGER"
+                <TextBlock Text="NODE SUPERVISOR"
                            Foreground="#F0F0F0"
                            FontSize="34"
                            FontWeight="SemiBold"

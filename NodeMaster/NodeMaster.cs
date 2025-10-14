@@ -60,8 +60,8 @@ namespace NodeMaster
             row.CpuLogicalCores = cfg.CpuLogicalCores;
             row.HasGpu = cfg.HasGpu;
             row.GpuModel = cfg.GpuModel ?? "";
-            row.GpuMemoryMB = cfg.GpuMemoryMB;
-            row.GpuCount = cfg.GpuCount;
+            row.GpuMemoryMB = cfg.GpuMemoryMB ?? 0;
+            row.GpuCount = cfg.GpuCount ?? 0;
             row.InstanceId = cfg.InstanceId ?? "";
             row.IsOnline = true;
             row.LastHeartbeat = DateTime.Now;

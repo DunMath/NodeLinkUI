@@ -1,31 +1,36 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
-  <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-  </PropertyGroup>
+	<PropertyGroup>
+		<!-- If you prefer to make Windows-only explicit, change to net8.0-windows -->
+		<TargetFramework>net8.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+	</PropertyGroup>
 
-  <ItemGroup>
-    <None Remove="NodeLink.config.json" />
-  </ItemGroup>
+	<!-- Keep the agent’s local config in this project only -->
+	<ItemGroup>
+		<None Remove="NodeLink.config.json" />
+		<Content Include="NodeLink.config.json">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+			<CopyToPublishDirectory>Never</CopyToPublishDirectory>
+		</Content>
+	</ItemGroup>
 
-  <ItemGroup>
-    <Content Include="NodeLink.config.json">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </Content>
-  </ItemGroup>
+	<ItemGroup>
+		<!-- mDNS discovery -->
+		<PackageReference Include="Makaretu.Dns" Version="2.0.1" />
+		<PackageReference Include="Makaretu.Dns.Multicast" Version="0.27.0" />
+		<!-- Perf counters / system info (Windows-friendly) -->
+		<PackageReference Include="System.Diagnostics.PerformanceCounter" Version="9.0.9" />
+		<PackageReference Include="System.Management" Version="9.0.9" />
+	</ItemGroup>
 
-  <ItemGroup>
-    <PackageReference Include="Makaretu.Dns" Version="2.0.1" />
-    <PackageReference Include="Makaretu.Dns.Multicast" Version="0.27.0" />
-    <PackageReference Include="System.Diagnostics.PerformanceCounter" Version="9.0.9" />
-    <PackageReference Include="System.Management" Version="9.0.9" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\NodeComm\NodeComm.csproj" />
-    <ProjectReference Include="..\NodeCore\NodeCore.csproj" />
-  </ItemGroup>
+	<ItemGroup>
+		<ProjectReference Include="..\NodeComm\NodeComm.csproj" />
+		<ProjectReference Include="..\NodeCore\NodeCore.csproj" />
+	</ItemGroup>
 
 </Project>
+
+
+

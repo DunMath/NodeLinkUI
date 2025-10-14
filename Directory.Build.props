@@ -1,0 +1,8 @@
+﻿<Project>
+	<!-- Default: do NOT publish NodeLink.config.json anywhere -->
+	<ItemGroup>
+		<None Update="**/NodeLink.config.json">
+			<CopyToPublishDirectory>Never</CopyToPublishDirectory>
+		</None>
+	</ItemGroup>
+</Project>
