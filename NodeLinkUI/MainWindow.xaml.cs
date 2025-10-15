@@ -1,5 +1,5 @@
-﻿// MainWindow.xaml.cs — v1.1 (adds orchestration + result collation + minor mDNS fix)
-// Previous v1.0.2: registration UX + rediscovery throttle + targeted broadcast + GPU smoothing
+﻿// MainWindow.xaml.cs — v1.1.1 (adds in-flight guard + heartbeat interval/sweep)
+// Previous v1.1: orchestration + result collation + minor mDNS fix
 
 using NodeComm;
 using NodeCore;
@@ -82,6 +82,10 @@ namespace NodeLinkUI
         private readonly HashSet<string> _registeredAgents = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, DateTime> _lastDiscoveryLog = new(StringComparer.OrdinalIgnoreCase);
         private static readonly TimeSpan DiscoveryLogMinGap = TimeSpan.FromSeconds(30);
+
+        // In-flight guard (don’t hammer a single agent while a unit is outstanding)
+        private readonly Dictionary<string, DateTime> _inFlightByAgent = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly TimeSpan InFlightHold = TimeSpan.FromSeconds(6);
 
         // IDs / mDNS
         private readonly string _thisInstanceId = Guid.NewGuid().ToString();
@@ -498,6 +502,14 @@ namespace NodeLinkUI
             // centralize all outbound compute through SoftDispatcher (fallback to comm)
             _orchestrator.DispatchRequested += (agentId, corrId, payload) =>
             {
+                // In-flight guard
+                if (!CanDispatchTo(agentId))
+                {
+                    Log($"Dispatch skipped: {agentId} still in-flight.");
+                    return;
+                }
+                MarkInFlight(agentId);
+
                 if (_softDispatcher != null)
                     _softDispatcher.Enqueue(agentId, corrId, payload);
                 else
@@ -662,6 +674,9 @@ namespace NodeLinkUI
             {
                 _collator?.Accept(env);
                 _orchestrator?.OnResult(env);
+
+                // Clear in-flight on any valid result
+                ClearInFlight(agentId);
                 return;
             }
 
@@ -746,6 +761,9 @@ namespace NodeLinkUI
 
                     _softDispatcher?.OnResultReceived(aId);
                     UpdateSoftThreadStats();
+
+                    // Clear in-flight on result
+                    ClearInFlight(aId);
 
                     Log($"Self-test result from {aId}: {symbol}");
                 }
@@ -888,6 +906,9 @@ namespace NodeLinkUI
                     }
                 }
 
+                // Clear in-flight on result
+                ClearInFlight(agentId);
+
                 HandleComputeResultMessage(message, agentId);
                 return;
             }
@@ -902,6 +923,9 @@ namespace NodeLinkUI
                 }
                 Log($"Task response: {message}");
                 taskHistory.Add($"{DateTime.Now:T}: {message}");
+
+                // Clear in-flight on result
+                ClearInFlight(agentId);
 
                 HandleComputeResultMessage(message, agentId);
                 return;
@@ -1031,6 +1055,14 @@ namespace NodeLinkUI
             var agent = agentStatuses.FirstOrDefault(a => a.IsOnline && a.AgentId != "Master");
             if (agent == null) { Log("No online agents."); return; }
 
+            // In-flight guard
+            if (!CanDispatchTo(agent.AgentId))
+            {
+                Log($"Skip custom task: {agent.AgentId} still in-flight.");
+                return;
+            }
+            MarkInFlight(agent.AgentId);
+
             string taskId = Guid.NewGuid().ToString();
             string payload = $"CustomTask:{taskId}:{task}";
 
@@ -1140,6 +1172,14 @@ namespace NodeLinkUI
             var target = agentStatuses.FirstOrDefault(a => a.IsOnline && a.AgentId != "Master");
             if (target == null) { Log("No online agents to dispatch."); return; }
 
+            // In-flight guard
+            if (!CanDispatchTo(target.AgentId))
+            {
+                Log($"Skip dispatch: {target.AgentId} still in-flight.");
+                return;
+            }
+            MarkInFlight(target.AgentId);
+
             var seq = taskSequenceId++;
             string taskId = $"task-{seq}";
             string payload = $"Compute:QuickSmoke|{seq}|noop";
@@ -1202,6 +1242,14 @@ namespace NodeLinkUI
                 DisposeSoftThreads();
                 StopMdns();
                 SaveSettings();
+
+                // Heartbeat cleanup
+                try
+                {
+                    heartbeatTimer?.Stop();
+                    heartbeatTimer?.Dispose();
+                }
+                catch { }
             }
             catch { }
             Application.Current.Shutdown();
@@ -1209,7 +1257,13 @@ namespace NodeLinkUI
 
         private void ApplySettings()
         {
-            heartbeatTimer.Interval = Math.Max(1000, settings.HeartbeatIntervalMs);
+            // Clamp to reasonable range and apply without recreating the timer
+            var ms = Math.Max(1000, settings.HeartbeatIntervalMs);
+            if (heartbeatTimer != null)
+            {
+                heartbeatTimer.Interval = ms;
+                heartbeatTimer.AutoReset = true;
+            }
             Log($"Heartbeat: {heartbeatTimer.Interval} ms, Master IP: {settings.MasterIp}");
         }
 
@@ -1302,6 +1356,9 @@ namespace NodeLinkUI
 
         private void UpdateHeartbeat()
         {
+            // Sweep any stale in-flight entries so an agent doesn’t get “stuck” if a result is missed
+            SweepInFlight();
+
             if (currentRole == NodeRole.Master)
             {
                 var nowUtc = DateTime.UtcNow;
@@ -1755,6 +1812,47 @@ namespace NodeLinkUI
             return 0f;
         }
 
+        // ---------- In-flight helpers ----------
+        private bool CanDispatchTo(string agentId)
+        {
+            lock (_inFlightByAgent)
+            {
+                if (_inFlightByAgent.TryGetValue(agentId, out var since))
+                {
+                    if ((DateTime.UtcNow - since) < InFlightHold) return false;
+                    // stale -> allow & refresh
+                    _inFlightByAgent.Remove(agentId);
+                }
+                return true;
+            }
+        }
+
+        private void MarkInFlight(string agentId)
+        {
+            lock (_inFlightByAgent)
+                _inFlightByAgent[agentId] = DateTime.UtcNow;
+        }
+
+        private void ClearInFlight(string agentId)
+        {
+            lock (_inFlightByAgent)
+                _inFlightByAgent.Remove(agentId);
+        }
+
+        private void SweepInFlight()
+        {
+            lock (_inFlightByAgent)
+            {
+                if (_inFlightByAgent.Count == 0) return;
+                var now = DateTime.UtcNow;
+                var stale = _inFlightByAgent
+                    .Where(kv => (now - kv.Value) >= InFlightHold)
+                    .Select(kv => kv.Key)
+                    .ToList();
+                foreach (var k in stale) _inFlightByAgent.Remove(k);
+            }
+        }
+
         // ---------- Grid helpers ----------
         private void RefreshGridPreservingSelection()
         {
@@ -1869,6 +1967,7 @@ namespace NodeLinkUI
         }
     }
 }
+
 
 
 
