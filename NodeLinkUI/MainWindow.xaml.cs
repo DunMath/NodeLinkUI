@@ -1,6 +1,5 @@
-﻿// MainWindow.xaml.cs — v1.0.2 (registration UX + rediscovery throttle + targeted broadcast + GPU smoothing)
-
-// MainWindow.xaml.cs — v1.0.2 (registration UX + rediscovery throttle + targeted broadcast + GPU smoothing)
+﻿// MainWindow.xaml.cs — v1.1 (adds orchestration + result collation + minor mDNS fix)
+// Previous v1.0.2: registration UX + rediscovery throttle + targeted broadcast + GPU smoothing
 
 using NodeComm;
 using NodeCore;
@@ -8,7 +7,6 @@ using NodeCore.Scheduling;
 using NodeMaster;
 using NodeAgent;
 //using NodeAgent.Bootstrapper;
-
 
 using System;
 using System.Collections.Generic;
@@ -29,14 +27,16 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
 using System.Windows.Media;
-using System.Linq;
 using Makaretu.Dns;
 
 // v1.0.2: control plane integration
 using NodeCore.Config;              // NodeLinkConfig.Load()
-using NodeMaster;         // MasterBootstrapper.Initialize/OnAgentDiscovered/AgentRegistered
+using NodeMaster;                   // MasterBootstrapper.Initialize/OnAgentDiscovered/AgentRegistered
 using MasterApp;                    // RegistrationClient
 using NodeCore.Protocol;            // Proto constants (Version/DefaultControlPort)
+
+// v1.1: orchestration (planner/dispatcher + collation)
+using NodeCore.Orchestration;
 
 namespace NodeLinkUI
 {
@@ -93,8 +93,10 @@ namespace NodeLinkUI
 
         private string? localAgentId;
 
-        // CPU meter (no P/Invoke)
+        // CPU/GPU meters
         private PerformanceCounter? _cpuTotalCounter;
+        private List<PerformanceCounter>? _gpuCounters;
+        private bool _gpuCountersInit;
 
         // ---- SoftThreads fields are provided by MainWindow.SoftThreads.cs partial ----
         // private SoftThreadDispatcher? _softDispatcher;
@@ -109,6 +111,10 @@ namespace NodeLinkUI
         // v1.0.2: config + HTTP registration client for the control plane
         private readonly NodeLinkConfig _cfg = NodeLinkConfig.Load();
         private readonly RegistrationClient _regClient = new();
+
+        // v1.1 orchestration
+        private DefaultOrchestrator? _orchestrator;
+        private DefaultResultCollator? _collator;
 
         // ---------- UI-thread helper ----------
         private void OnUI(Action work)
@@ -161,7 +167,7 @@ namespace NodeLinkUI
             {
                 try
                 {
-                    // 1) Registration fallback: MasterBootstrapper raises this if HTTP RegisterAck was missed
+                    // Registration fallback (if HTTP RegisterAck was missed)
                     MasterBootstrapper.AgentRegistered += agentId =>
                     {
                         OnUI(() =>
@@ -201,14 +207,7 @@ namespace NodeLinkUI
                         });
                     };
 
-                    // 2) Discovery: raised by MasterBootstrapper when mDNS finds an agent service
-                    // --- Replace ONLY the event handler for MasterBootstrapper.OnAgentDiscovered in your MainWindow constructor ---
-                    // Find this block in your constructor:
-
-                    // MasterBootstrapper.OnAgentDiscovered += ip => { ... }
-
-                    // Replace ONLY the lambda parameter and the logic inside with the following:
-
+                    // Discovery from MasterBootstrapper (mDNS finds an agent service)
                     MasterBootstrapper.OnAgentDiscovered += agent =>
                     {
                         OnUI(() =>
@@ -218,7 +217,7 @@ namespace NodeLinkUI
 
                             if (row == null)
                             {
-                                // Discovered (not registered yet)
+                                // Discovered (not necessarily registered yet)
                                 row = new AgentStatus
                                 {
                                     AgentId = agent.AgentId,
@@ -239,7 +238,6 @@ namespace NodeLinkUI
                             RefreshGridPreservingSelection();
                         });
                     };
-
                 }
                 catch (Exception ex)
                 {
@@ -251,10 +249,7 @@ namespace NodeLinkUI
                     SetupAgentDiscovery();
                 }
             }
-
         }
-
-
 
         // -------- Sorting: Master first, then AgentId
         private sealed class AgentRowComparer : System.Collections.IComparer
@@ -410,6 +405,9 @@ namespace NodeLinkUI
 
                 InitializeSoftThreadsForMaster();
 
+                // v1.1: Initialize orchestration (planner/dispatcher + result collation)
+                InitializeOrchestration();
+
                 // Initial broadcast to wake agents
                 _ = Task.Run(async () =>
                 {
@@ -479,7 +477,32 @@ namespace NodeLinkUI
                 var pulse = BuildAgentPulse(localAgentId);
                 comm.SendToMaster($"AgentPulse:{JsonSerializer.Serialize(pulse)}");
             }
+        }
 
+        // v1.1 — orchestration init (master only)
+        private void InitializeOrchestration()
+        {
+            if (currentRole != NodeRole.Master) return;
+
+            // create collator
+            _collator = new DefaultResultCollator();
+            _collator.JobCompleted += (app, runId, ordered) =>
+            {
+                Log($"Job complete: {app} run={runId} ({ordered.Count} results).");
+                // TODO: assemble into final output / write file / update UI
+            };
+
+            // create orchestrator; pass a snapshot of current grid rows
+            _orchestrator = new DefaultOrchestrator(() => agentStatuses.ToList());
+
+            // centralize all outbound compute through SoftDispatcher (fallback to comm)
+            _orchestrator.DispatchRequested += (agentId, corrId, payload) =>
+            {
+                if (_softDispatcher != null)
+                    _softDispatcher.Enqueue(agentId, corrId, payload);
+                else
+                    comm.SendToAgent(agentId, payload);
+            };
         }
 
         private IPAddress? ParseIp(string ip) => IPAddress.TryParse(ip, out var a) ? a : null;
@@ -631,6 +654,15 @@ namespace NodeLinkUI
                     Log($"Queued work on Agent: {message}");
                     return;
                 }
+            }
+
+            // v1.1 — unified result ingest for orchestrated runs (master only)
+            if (currentRole == NodeRole.Master &&
+                ResultWire.TryParseFromWire(message, agentId, out var env))
+            {
+                _collator?.Accept(env);
+                _orchestrator?.OnResult(env);
+                return;
             }
 
             // Master: RegisterAck -> mark registered + auto-smoke
@@ -834,7 +866,7 @@ namespace NodeLinkUI
                 return;
             }
 
-            // ComputeResult collation + surface to grid
+            // ComputeResult collation + surface to grid (legacy path)
             if (message.StartsWith("ComputeResult:", StringComparison.OrdinalIgnoreCase))
             {
                 _softDispatcher?.OnResultReceived(agentId);
@@ -860,7 +892,7 @@ namespace NodeLinkUI
                 return;
             }
 
-            // Task list updates + surface to row
+            // Task list updates + surface to row (legacy path)
             if (message.StartsWith("Result:", StringComparison.OrdinalIgnoreCase))
             {
                 if (currentRole == NodeRole.Master)
@@ -1122,23 +1154,37 @@ namespace NodeLinkUI
             Log($"Dispatched test task to {target.AgentId}: {payload}");
         }
 
+        // v1.1: Compute Test uses orchestrator to split into 32 units and submit
         private async void ComputeTest_Click(object sender, RoutedEventArgs e)
         {
             if (currentRole != NodeRole.Master) { Log("Only in Master mode."); return; }
+
+            if (_orchestrator == null || _collator == null)
+            {
+                Log("Orchestrator not ready.");
+                return;
+            }
+
+            // Gather online agents (orchestrator will handle placement, but it's useful to nudge availability)
             var targets = agentStatuses.Where(a => a.IsOnline && a.AgentId != "Master").ToList();
             if (targets.Count == 0) { Log("No online agents to test."); return; }
 
+            // Example orchestration run: QuickSmoke split into 32 chunks
             var runId = Guid.NewGuid().ToString("N");
-            foreach (var a in targets)
-            {
-                var payload = $"Compute:QuickSmoke|0|noop";
-                var tid = $"smoke-{runId}-{a.AgentId}";
-                if (_softDispatcher != null) _softDispatcher.Enqueue(a.AgentId, tid, payload);
-                else comm.SendToAgent(a.AgentId, payload);
-            }
+            var units = new List<TaskUnit>();
+            const string app = "QuickSmoke";
 
-            await Task.Delay(1500);
-            Log("ComputeTest round dispatched.");
+            for (int i = 0; i < 32; i++)
+                units.Add(new TaskUnit { App = app, Seq = i, Payload = "noop" });
+
+            // Tell the collator how many results we expect
+            _collator.StartJob(runId, app, units.Count);
+
+            // Submit to the orchestrator (it will raise DispatchRequested for each unit)
+            _orchestrator.Submit(runId, units);
+
+            await Task.Delay(500);
+            Log($"ComputeTest orchestrated run submitted: {app} run={runId} units={units.Count}");
         }
 
         private void SettingsButton_Click(object sender, RoutedEventArgs e)
@@ -1204,6 +1250,7 @@ namespace NodeLinkUI
                     MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
+
         private void HelpMenu_Click(object sender, RoutedEventArgs e)
         {
             try
@@ -1394,11 +1441,9 @@ namespace NodeLinkUI
                     }
                 }
 
-                // Auto-register only if not already registered (avoid churn)
-                if (currentRole == NodeRole.Master && !_registeredAgents.Contains(agentId) && !alreadyRegistered) ;
-                }
+                // (Optional auto-register can be inserted here if desired)
             }
-        
+        }
 
         private void Mdns_ServiceInstanceShutdown(object? sender, ServiceInstanceShutdownEventArgs e)
         {
@@ -1588,8 +1633,6 @@ namespace NodeLinkUI
             catch { _gpuCounters = null; }
             _gpuCountersInit = true;
         }
-        private List<PerformanceCounter>? _gpuCounters;
-        private bool _gpuCountersInit;
 
         private float GetGpuUtilizationPercent()
         {
@@ -1812,7 +1855,6 @@ namespace NodeLinkUI
             public ulong ullAvailVirtual;
             public ulong ullAvailExtendedVirtual;
         }
-        // fields, ctor, etc...
 
         private sealed class AgentCommAdapter : NodeAgent.INodeComm
         {
@@ -1824,7 +1866,6 @@ namespace NodeLinkUI
 
         private void NodeGrid_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
-
         }
     }
 }
