@@ -1,14 +1,11 @@
 ﻿using System;
 using System.Diagnostics;
-using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading.Tasks;
 using System.Windows;
 
-using NodeCore;                  // AgentStatus (typed)
-using NodeCore.Config;           // NodeLinkConfig.Load()
-using NodeMaster;      // MasterBootstrapper.Initialize(...)
+using NodeCore.Config; // NodeLinkConfig.Load()
 
 namespace NodeLinkUI
 {
@@ -16,36 +13,26 @@ namespace NodeLinkUI
     {
         private async void Application_Startup(object sender, StartupEventArgs e)
         {
-            // --- Splash stays as-is (keeps your current UX) ---
+            // Show splash
             var splash = new SplashWindow();
             splash.Show();
 
-            // Keep this short/snappy
+            // Keep startup snappy
             await Task.Delay(600);
 
-            // Create the main window first so we can hook logging to the UI later if desired
-            var main = new MainWindow();
-            MainWindow = main;
-
-            // --- New: load shared config & initialize the master bootstrap once ---
+            // Load config (optional: useful for early diagnostics)
             var cfg = NodeLinkConfig.Load();
             Debug.WriteLine($"[UI] CFG Http={cfg.UseHttpControlPlane} UdpReg={cfg.UseLegacyUdpRegistration} HealthSecs={cfg.HealthPollSeconds}");
 
-            // Typed, minimal delegates (no dynamic / no IQueryable)
-            MasterBootstrapper.Initialize(
-                log: s => Debug.WriteLine(s),
-                getAgents: () => Enumerable.Empty<AgentStatus>(),     // will wire to main's collection later
-                updateAgent: a => { /* no-op; UI refresh hook if needed */ },
-                getMasterId: () => "Master",
-                getMasterIp: () => GetPrimaryIPv4()
-            );
-
-            // Show main and close splash
+            // Create and show main window (all master/agent bootstrap now lives in MainWindow)
+            var main = new MainWindow();
+            MainWindow = main;
             main.Show();
+
             splash.Close();
         }
 
-        // Local helper so we don't depend on external NetUtil in this UI layer
+        // Helper kept in case you use it elsewhere later
         private static string GetPrimaryIPv4()
         {
             try
@@ -53,8 +40,7 @@ namespace NodeLinkUI
                 string best = "127.0.0.1";
                 foreach (var ni in Dns.GetHostEntry(Dns.GetHostName()).AddressList)
                 {
-                    if (ni.AddressFamily == AddressFamily.InterNetwork &&
-                        !IPAddress.IsLoopback(ni))
+                    if (ni.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(ni))
                     {
                         best = ni.ToString();
                         break;
@@ -69,6 +55,7 @@ namespace NodeLinkUI
         }
     }
 }
+
 
 
 

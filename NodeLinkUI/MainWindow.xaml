@@ -1,7 +1,7 @@
 ﻿<Window x:Class="NodeLinkUI.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="NodeLinkUI" Height="800" Width="1200"
+        Title="NodeLinkUI" Height="800" Width="1500"
         WindowStartupLocation="CenterScreen">
     <Window.Resources>
         <!-- Flat button look (non-3D) -->
@@ -35,7 +35,7 @@
             <!-- Row 2: Main DataGrid -->
             <RowDefinition Height="*"/>
             <!-- Row 3: Bottom panels (Logs | Alerts | Tasks) -->
-            <RowDefinition Height="250"/>
+            <RowDefinition Height="400"/>
         </Grid.RowDefinitions>
 
         <!-- ===== Row 0: HEADER ===== -->
@@ -82,8 +82,8 @@
                 <StackPanel Orientation="Horizontal" Grid.Column="0">
                     <Button x:Name="RegisterAgentButton" Content="Register" Style="{StaticResource FlatButton}"
                             Click="RegisterAgent_Click"/>
-                    <Button x:Name="DispatchTaskButton" Content="Dispatch Test" Style="{StaticResource FlatButton}"
-                            Click="DispatchTask_Click"/>
+                    <Button x:Name="DispatchTaskButton" Content="Dispatch Node Test" Style="{StaticResource FlatButton}"
+                            Click="DispatchTest_Click"/>
                     <Button Content="Compute Test" Style="{StaticResource FlatButton}"
                             Click="ComputeTest_Click"/>
                     <Button x:Name="BroadcastButton" Content="Broadcast Ping" Style="{StaticResource FlatButton}"

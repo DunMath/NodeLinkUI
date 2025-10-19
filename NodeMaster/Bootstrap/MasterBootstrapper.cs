@@ -1,363 +1,252 @@
-﻿// NodeMaster/Bootstrap/MasterBootstrapper.cs — v1.1
+﻿using System;
 using System.Collections.Concurrent;
 using System.Net;
-using System.Text.Json;
-using NodeCore;
-using NodeMaster;
-using NodeMaster.State;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
 
-namespace NodeMaster
+namespace NodeMaster.Bootstrap
 {
     /// <summary>
-    /// Central authority on the Master side that:
-    ///  - tracks known agents (config + pulses)
-    ///  - raises discovery/registration events for the UI
-    ///  - maintains sticky IP leases (MAC -> IP) for 6 months
-    ///  - records compute round-trip latency (dispatch -> result)
+    /// Master-side bootstrapper that owns the Agent registration workflow:
+    /// - Issues HTTP POST /nl/register?agentId=...&corr=...
+    /// - Retries with backoff
+    /// - Validates RegisterAck that must include the corr (back-compat supported)
+    /// - Raises UI-friendly events for success/failure
     /// </summary>
-    public sealed class MasterBootstrapper
+    public sealed class MasterBootstrapper : IDisposable
     {
-        // === Back-compat static events expected by the UI ===
-        // (UI does: MasterBootstrapper.AgentRegistered += ... etc.)
-        public static event Action<string>? AgentRegistered;
-        public static event Action<AgentStatus>? OnAgentDiscovered;
+        // ----- Public events the UI (MainWindow) can subscribe to -----
+        public event Action<string>? RegistrationSucceeded;                   // agentId
+        public event Action<string, string>? RegistrationFailed;              // agentId, reason
+        public event Action<string, int, int, string>? RegistrationAttempt;   // agentId, attempt, max, corr
 
-        // Preferred richer, instance-scoped stream of status updates
-        public event Action<AgentStatus>? OnAgentStatus;
+        // ----- Configuration (tweakable) -----
+        private readonly int _maxAttempts = 4;
+        private readonly TimeSpan _httpTimeout = TimeSpan.FromSeconds(4);
+        private readonly TimeSpan _ackWait = TimeSpan.FromSeconds(3);
+        private readonly TimeSpan _betweenAttempts = TimeSpan.FromMilliseconds(500);
 
-        // In-memory agent state
-        private readonly Dictionary<string, AgentStatus> _agents = new(StringComparer.OrdinalIgnoreCase);
-        private readonly HashSet<string> _everDiscovered = new(StringComparer.OrdinalIgnoreCase);
-        private readonly object _lock = new();
+        // ----- Plumbing -----
+        private readonly HttpClient _http;
+        private readonly Action<string> _log;
 
-        // Track compute dispatch times so we can compute round-trip latency at result time
-        // Key: (agentId, taskId) -> utc dispatch time
-        private readonly ConcurrentDictionary<(string agentId, string taskId), DateTime> _dispatchTimesUtc
-            = new();
-
-        // Sticky MAC->IP reservations (6 months)
-        private readonly LeaseStore _leases = new(
-            Path.Combine(AppContext.BaseDirectory, "state", "leases.json"),
-            TimeSpan.FromDays(180));
-
-        // --- Add this static method to match UI usage ---
-        public static void Initialize(
-            Action<string> log,
-            Func<IEnumerable<AgentStatus>> getAgents,
-            Action<AgentStatus> updateAgent,
-            Func<string> getMasterId,
-            Func<string> getMasterIp)
+        // Prevent parallel registration attempts per agent
+        private sealed class Inflight
         {
-            // You can add initialization logic here if needed.
-            log?.Invoke("[MasterBootstrapper] Initialized.");
-            // Example: You could wire up static events, load state, etc.
+            public string CurrentCorr = "";
+            public int Attempt = 0;
         }
-            // ---------- Public API ----------
+        private readonly ConcurrentDictionary<string, Inflight> _inflightByAgent = new(); // key = agentId
 
-            /// <summary>
-            /// Call this from your comms layer for every inbound payload.
-            /// </summary>
-        public void HandleInbound(string fromId, string payload)
+        // Match ACKs to attempts
+        private readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> _ackWaiters = new(); // key = corr
+        private readonly ConcurrentDictionary<string, string> _corrToAgent = new(); // key = corr -> agentId
+
+        private volatile bool _disposed;
+
+        public MasterBootstrapper(Action<string> log)
         {
-            if (payload.StartsWith("AgentConfig:", StringComparison.Ordinal))
-            {
-                var json = payload.AsSpan("AgentConfig:".Length);
-                var cfg = JsonSerializer.Deserialize<AgentConfig>(json);
-                if (cfg != null) ApplyAgentConfig(cfg, fromId);
-                return;
-            }
+            _log = log ?? (_ => { });
 
-            if (payload.StartsWith("AgentPulse:", StringComparison.Ordinal))
+            var handler = new SocketsHttpHandler
             {
-                ApplyAgentPulse(payload.Substring("AgentPulse:".Length), fromId);
-                return;
-            }
+                AllowAutoRedirect = false,
+                AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
+                PooledConnectionIdleTimeout = TimeSpan.FromSeconds(30)
+            };
+            _http = new HttpClient(handler);
+            _http.Timeout = _httpTimeout;
+        }
 
-            if (payload.StartsWith("ComputeResult:", StringComparison.Ordinal))
-            {
-                // Expected form:  ComputeResult:{TaskId}:{Status}
-                // If your wire format differs, adapt the parsing below.
-                // We'll try to parse TaskId to compute latency.
-                try
-                {
-                    var rest = payload.Substring("ComputeResult:".Length);
-                    var sep = rest.IndexOf(':');
-                    if (sep > 0)
-                    {
-                        var taskId = rest.Substring(0, sep);
-                        NoteComputeResult(fromId, taskId, DateTime.UtcNow);
-                    }
-                }
-                catch
-                {
-                    // ignore malformed result; no latency update
-                }
-                return;
-            }
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
 
-            // other payloads ignored here
+            foreach (var kvp in _ackWaiters)
+                kvp.Value.TrySetCanceled();
+
+            _http.Dispose();
         }
 
         /// <summary>
-        /// Master-side: mark an agent as successfully registered (HTTP control plane).
-        /// Optionally provide MAC and IP so we can persist a sticky lease.
+        /// UI calls this to start a registration workflow for a given agent.
         /// </summary>
-        public void MarkRegistered(string agentId, string? mac, IPAddress? ip)
-        {
-            lock (_lock)
-            {
-                var s = GetOrCreate(agentId);
-                s.Registered = true;
-                s.IsOnline = true;
-                s.LastSeen = DateTime.UtcNow;
-
-                if (!string.IsNullOrWhiteSpace(mac))
-                {
-                    var normMac = LeaseStore.NormalizeMac(mac);
-                    if (ip != null)
-                    {
-                        var lease = _leases.Upsert(normMac, ip, s.AgentId);
-                        s.Mac = lease.Mac;
-                        s.StickyIp = lease.Ip;
-                        s.IpAddress ??= ip.ToString();
-                    }
-                    else
-                    {
-                        s.Mac = normMac;
-                        var sticky = _leases.TryGetByMac(normMac);
-                        if (sticky != null)
-                        {
-                            s.StickyIp = sticky.Ip;
-                            s.IpAddress ??= sticky.Ip;
-                        }
-                    }
-                }
-
-                // UI updates
-                OnAgentStatus?.Invoke(Clone(s));
-            }
-
-            // Back-compat static event for the existing UI wiring
-            AgentRegistered?.Invoke(agentId);
-        }
+        public Task RegisterAgent(string agentId, string ip)
+            => RegisterAgentInternalAsync(agentId, ip);
 
         /// <summary>
-        /// Call this at dispatch time so we can compute latency at result time.
+        /// MainWindow should forward raw agent messages here so we can validate ACKs.
+        /// Expected ACK: "RegisterAck:AgentId:<corr>" (preferred) or legacy "RegisterAck:AgentId:timestamp".
         /// </summary>
-        public void NoteComputeDispatched(string agentId, string taskId, DateTime utcDispatched)
+        public void OnAgentMessage(string agentId, string message)
         {
-            _dispatchTimesUtc[(agentId, taskId)] = utcDispatched;
-        }
+            if (string.IsNullOrWhiteSpace(message)) return;
 
-        /// <summary>
-        /// Call this when a compute result arrives; updates per-agent latency metrics.
-        /// </summary>
-        public void NoteComputeResult(string agentId, string taskId, DateTime utcResult)
-        {
-            if (_dispatchTimesUtc.TryRemove((agentId, taskId), out var sentAt))
-            {
-                var ms = Math.Max(0, (utcResult - sentAt).TotalMilliseconds);
+            if (!message.StartsWith("RegisterAck:", StringComparison.OrdinalIgnoreCase))
+                return;
 
-                lock (_lock)
-                {
-                    var s = GetOrCreate(agentId);
-                    s.LastLatencyMs = ms;
-
-                    // Simple streaming average
-                    if (s.Samples <= 0)
-                    {
-                        s.AvgLatencyMs = ms;
-                        s.Samples = 1;
-                    }
-                    else
-                    {
-                        s.AvgLatencyMs = (s.AvgLatencyMs * s.Samples + ms) / (s.Samples + 1);
-                        s.Samples += 1;
-                    }
-
-                    s.SelfTestStatus = "✓"; // treat successful compute as healthy
-                    s.IsOnline = true;
-                    s.LastSeen = DateTime.UtcNow;
-
-                    OnAgentStatus?.Invoke(Clone(s));
-                }
-            }
-        }
-
-        // ---------- Internal handlers ----------
-
-        private void ApplyAgentConfig(AgentConfig cfg, string fromId)
-        {
-            lock (_lock)
-            {
-                var id = cfg.AgentId ?? fromId;
-                var isNew = !_agents.ContainsKey(id);
-
-                var s = GetOrCreate(id);
-                s.AgentId = id;
-                s.IsOnline = true;
-                s.LastSeen = DateTime.UtcNow;
-
-                // Hardware snapshot
-                s.HasGpu = cfg.HasGpu;
-                s.GpuModel = cfg.GpuModel;
-                s.GpuMemoryMB = cfg.GpuMemoryMB ?? 0;
-
-                // Prefer reported IP, then sticky if present
-                if (!string.IsNullOrWhiteSpace(cfg.Ip))
-                    s.IpAddress = cfg.Ip;
-                else if (!string.IsNullOrWhiteSpace(s.StickyIp))
-                    s.IpAddress ??= s.StickyIp;
-
-                // Sticky lease if we know MAC and any IP
-                if (!string.IsNullOrWhiteSpace(cfg.Mac))
-                {
-                    var mac = LeaseStore.NormalizeMac(cfg.Mac);
-                    var ip = ParseIp(s.IpAddress) ?? ParseIp(cfg.Ip);
-                    if (ip != null)
-                    {
-                        var lease = _leases.Upsert(mac, ip, s.AgentId);
-                        s.Mac = lease.Mac;
-                        s.StickyIp = lease.Ip;
-                    }
-                    else
-                    {
-                        s.Mac = mac;
-                        var sticky = _leases.TryGetByMac(mac);
-                        if (sticky != null) s.StickyIp = sticky.Ip;
-                    }
-                }
-
-                // Notify UI
-                OnAgentStatus?.Invoke(Clone(s));
-
-                // Back-compat "discovered" event (fire once per app session)
-                if (isNew && _everDiscovered.Add(id))
-                {
-                    OnAgentDiscovered?.Invoke(Clone(s));
-                }
-            }
-        }
-
-        private void ApplyAgentPulse(string json, string fromId)
-        {
             try
             {
-                using var doc = JsonDocument.Parse(json);
-                var root = doc.RootElement;
+                // Accept both: RegisterAck:AgentId:<corr>  and  RegisterAck:AgentId:<timestamp>
+                // We only "complete" a waiter if a corr is included and matches a pending entry.
+                var parts = message.Split(':', StringSplitOptions.RemoveEmptyEntries);
+                // parts[0] = "RegisterAck"
+                var ackAgentId = parts.Length > 1 ? parts[1].Trim() : agentId;
 
-                var id = root.GetProperty("AgentId").GetString() ?? fromId;
-
-                // Parse with tolerance (float & int fallbacks)
-                float cpu = TryGetSingle(root, "CpuUsagePercent");
-                float mem = TryGetSingle(root, "MemoryAvailableMB");
-                float gpu = TryGetSingle(root, "GpuUsagePercent");
-                int queue = TryGetInt(root, "TaskQueueLength");
-
-                lock (_lock)
+                string? corr = null;
+                if (parts.Length >= 3)
                 {
-                    var isNew = !_agents.ContainsKey(id);
-                    var s = GetOrCreate(id);
+                    // parts[2] might be a corr (GUID) in the new format, or a timestamp (legacy).
+                    var token = parts[2].Trim();
+                    if (Guid.TryParse(token, out _))
+                        corr = token;
+                    else if (parts.Length >= 4 && Guid.TryParse(parts[3].Trim(), out _))
+                        corr = parts[3].Trim();
+                }
 
-                    s.CpuUsagePercent = cpu;
-                    s.MemoryAvailableMB = mem;
-                    s.GpuUsagePercent = gpu;
-                    s.TaskQueueLength = queue;
-
-                    s.IsOnline = true;
-                    s.LastSeen = DateTime.UtcNow;
-
-                    OnAgentStatus?.Invoke(Clone(s));
-
-                    if (isNew && _everDiscovered.Add(id))
+                if (!string.IsNullOrWhiteSpace(corr))
+                {
+                    // New format: match corr precisely
+                    if (_ackWaiters.TryGetValue(corr, out var tcs))
                     {
-                        OnAgentDiscovered?.Invoke(Clone(s));
+                        // Avoid double-complete
+                        if (tcs.TrySetResult(true))
+                        {
+                            _log($"RegisterAck accepted from {ackAgentId} (corr match).");
+                            RegistrationSucceeded?.Invoke(ackAgentId);
+                        }
+                    }
+                    else
+                    {
+                        // Corr we didn't issue (or already timed out) – ignore without UI noise.
+                        _log("CorrelationId mismatch (stale or unexpected ACK).");
+                    }
+                }
+                else
+                {
+                    // Legacy ACK (no corr). Best-effort: accept if we have an inflight slot for this agent.
+                    if (_inflightByAgent.ContainsKey(ackAgentId))
+                    {
+                        _log($"RegisterAck accepted from {ackAgentId} (legacy format).");
+                        RegistrationSucceeded?.Invoke(ackAgentId);
+                    }
+                    else
+                    {
+                        _log("RegisterAck ignored (no in-flight entry and no corr).");
                     }
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // ignore malformed pulse
+                _log($"RegisterAck parse/handle error: {ex.Message}");
             }
         }
 
-        // ---------- Helpers ----------
+        // ------------------------- internals -------------------------
 
-        private static float TryGetSingle(JsonElement root, string name)
+        private async Task RegisterAgentInternalAsync(string agentId, string ip)
         {
-            if (!root.TryGetProperty(name, out var el)) return 0f;
-            return el.ValueKind switch
+            if (string.IsNullOrWhiteSpace(agentId) || string.IsNullOrWhiteSpace(ip))
             {
-                JsonValueKind.Number when el.TryGetSingle(out var f) => f,
-                JsonValueKind.Number when el.TryGetDouble(out var d) => (float)d,
-                _ => 0f
-            };
-        }
+                RegistrationFailed?.Invoke(agentId, "Invalid agentId or IP.");
+                return;
+            }
 
-        private static int TryGetInt(JsonElement root, string name)
-        {
-            if (!root.TryGetProperty(name, out var el)) return 0;
-            return el.ValueKind switch
+            // in-flight guard
+            if (!_inflightByAgent.TryAdd(agentId, new Inflight()))
             {
-                JsonValueKind.Number when el.TryGetInt32(out var i) => i,
-                JsonValueKind.Number when el.TryGetDouble(out var d) => (int)d,
-                _ => 0
-            };
-        }
+                _log($"Registration already in-flight for {agentId} – skipped.");
+                return;
+            }
 
-        private static IPAddress? ParseIp(string? ip)
-            => IPAddress.TryParse(ip, out var addr) ? addr : null;
-
-        private AgentStatus GetOrCreate(string agentId)
-        {
-            if (!_agents.TryGetValue(agentId, out var s))
+            try
             {
-                s = new AgentStatus
+                var inflight = _inflightByAgent[agentId];
+
+                for (int attempt = 1; attempt <= _maxAttempts; attempt++)
                 {
-                    AgentId = agentId,
-                    SelfTestStatus = "…",
-                    // defaults for stability
-                    CpuUsagePercent = 0,
-                    MemoryAvailableMB = 0,
-                    GpuUsagePercent = 0,
-                    TaskQueueLength = 0
-                };
-                _agents[agentId] = s;
+                    inflight.Attempt = attempt;
+
+                    var corr = Guid.NewGuid().ToString();
+                    inflight.CurrentCorr = corr;
+                    _corrToAgent[corr] = agentId;
+
+                    RegistrationAttempt?.Invoke(agentId, attempt, _maxAttempts, corr);
+                    _log($"RegisterRequest -> {ip}:50555 (attempt {attempt}/{_maxAttempts}, corr {corr})");
+
+                    var url = $"http://{ip}:50555/nl/register?agentId={WebUtility.UrlEncode(agentId)}&corr={WebUtility.UrlEncode(corr)}";
+
+                    bool httpOk = false;
+                    try
+                    {
+                        using var cts = new CancellationTokenSource(_httpTimeout);
+                        using var resp = await _http.PostAsync(url, new ByteArrayContent(Array.Empty<byte>()), cts.Token);
+                        if ((int)resp.StatusCode >= 200 && (int)resp.StatusCode < 300)
+                        {
+                            _log("Register HTTP OK (awaiting ACK).");
+                            httpOk = true;
+                        }
+                        else
+                        {
+                            _log($"Register HTTP {(int)resp.StatusCode} ERR");
+                        }
+                    }
+                    catch (TaskCanceledException)
+                    {
+                        _log("Register HTTP timeout.");
+                    }
+                    catch (Exception ex)
+                    {
+                        _log($"Register network error: {ex.Message}");
+                    }
+
+                    if (httpOk)
+                    {
+                        // Wait briefly for a matching ACK
+                        var ok = await WaitForAckAsync(agentId, corr, _ackWait);
+                        if (ok)
+                        {
+                            // Success event is raised in OnAgentMessage when ACK arrives.
+                            return;
+                        }
+                        else
+                        {
+                            _log("No matching ACK within window.");
+                        }
+                    }
+
+                    await Task.Delay(_betweenAttempts);
+                }
+
+                RegistrationFailed?.Invoke(agentId, "All attempts exhausted without a matching ACK.");
+                _log("Register failed after all retries.");
             }
-            return s;
+            finally
+            {
+                _inflightByAgent.TryRemove(agentId, out _);
+            }
         }
 
-        private static AgentStatus Clone(AgentStatus s) => new()
+        private async Task<bool> WaitForAckAsync(string agentId, string corr, TimeSpan timeout)
         {
-            AgentId = s.AgentId,
-            IpAddress = s.IpAddress,
-            StickyIp = s.StickyIp,
-            Mac = s.Mac,
-            Registered = s.Registered,
-            IsOnline = s.IsOnline,
-            IsDegraded = s.IsDegraded,
-            LastSeen = s.LastSeen,
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _ackWaiters[corr] = tcs;
 
-            CpuUsagePercent = s.CpuUsagePercent,
-            MemoryAvailableMB = s.MemoryAvailableMB,
+            using var cts = new CancellationTokenSource(timeout);
+            using var reg = cts.Token.Register(() => tcs.TrySetResult(false));
 
-            HasGpu = s.HasGpu,
-            GpuModel = s.GpuModel,
-            GpuMemoryMB = s.GpuMemoryMB,
-            GpuUsagePercent = s.GpuUsagePercent,
-            GpuCount = s.GpuCount,            // kept if you add it to AgentStatus
-            HasCuda = s.HasCuda,              // kept if you add it to AgentStatus
+            var result = await tcs.Task;
 
-            TaskQueueLength = s.TaskQueueLength,
-            SoftThreadsQueued = s.SoftThreadsQueued,
-            SelfTestStatus = s.SelfTestStatus,
+            _ackWaiters.TryRemove(corr, out _);
+            _corrToAgent.TryRemove(corr, out _);
 
-            LastLatencyMs = s.LastLatencyMs,
-            AvgLatencyMs = s.AvgLatencyMs,
-            Samples = s.Samples
-        };
+            return result;
+        }
     }
 }
+
 
 
 

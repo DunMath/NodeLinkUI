@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -26,14 +27,13 @@ namespace NodeAgent
     ///   GET  / or /nl                 -> { AgentId, Status, Utc }
     ///   GET  /health or /nl/health    -> "OK"
     ///   GET  /info or /nl/info        -> AgentConfig JSON
-    ///   POST /register or /nl/register-> sends RegisterAck to master, returns JSON { Ack = true }
+    ///   POST /register or /nl/register-> sends RegisterAck (echoes ?corr=) to master, returns JSON { Ack = true }
     ///
     ///   POST /compute                 -> queue work (string body); returns { accepted, taskId }
     ///   GET  /tasks/next              -> debug: peek the next queued task (non-destructive)
     ///   POST /task/result             -> optional manual result reporting { taskId, status, detail }
     ///
-    /// A lightweight background executor dequeues items from /compute and simulates
-    /// completing them; it sends "ComputeResult:<payload>:OK" back to the master.
+    /// A lightweight background executor dequeues items from /compute and completes them.
     /// </summary>
     public sealed class AgentBootstrapper
     {
@@ -192,6 +192,24 @@ namespace NodeAgent
             return path;
         }
 
+        private static Dictionary<string, string> ParseQuery(string rawPath)
+        {
+            var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrEmpty(rawPath)) return dict;
+            int q = rawPath.IndexOf('?');
+            if (q < 0 || q + 1 >= rawPath.Length) return dict;
+
+            var qs = rawPath.Substring(q + 1);
+            foreach (var tok in qs.Split('&', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var kv = tok.Split('=', 2);
+                string k = Uri.UnescapeDataString(kv[0]);
+                string v = kv.Length > 1 ? Uri.UnescapeDataString(kv[1]) : "";
+                dict[k] = v;
+            }
+            return dict;
+        }
+
         private async Task HandleClientAsync(TcpClient client)
         {
             using (client)
@@ -260,6 +278,9 @@ namespace NodeAgent
 
                     FileLogger.Info($"REQ {method} {rawPath} -> {path} len={contentLength}");
 
+                    // Pre-parse query (used for /register)
+                    var query = ParseQuery(rawPath);
+
                     // --- Route ---
                     if (string.Equals(method, "GET", StringComparison.OrdinalIgnoreCase) && (path == "/"))
                     {
@@ -277,15 +298,35 @@ namespace NodeAgent
                     }
                     else if (string.Equals(method, "POST", StringComparison.OrdinalIgnoreCase) && path == "/register")
                     {
-                        // Master polls this to mark the agent as registered
-                        _comm.SendToMaster($"RegisterAck:{_agentId}:{DateTimeOffset.UtcNow:O}");
-                        FileLogger.Info("RegisterAck sent to master.");
-                        await WriteJsonAsync(writer, new { AgentId = _agentId, Ack = true, WhenUtc = DateTime.UtcNow }).ConfigureAwait(false);
+                        // Master calls: POST /nl/register?agent=ID&corr=GUID
+                        string corr = query.TryGetValue("corr", out var c) ? c : "";
+                        string reqAgent = query.TryGetValue("agent", out var a) ? a : "";
+                        string agentId = string.IsNullOrWhiteSpace(reqAgent) ? _agentId : reqAgent;
+
+                        if (!string.IsNullOrEmpty(corr))
+                        {
+                            _comm.SendToMaster($"RegisterAck:{agentId}:{corr}:{DateTimeOffset.UtcNow:O}");
+                            FileLogger.Info($"RegisterAck sent (with corr) agent={agentId} corr={corr}");
+                        }
+                        else
+                        {
+                            // Back-compat path (no corr present)
+                            _comm.SendToMaster($"RegisterAck:{agentId}:{DateTimeOffset.UtcNow:O}");
+                            FileLogger.Info($"RegisterAck sent (legacy, no corr) agent={agentId}");
+                        }
+
+                        await WriteJsonAsync(writer, new
+                        {
+                            AgentId = agentId,
+                            Ack = true,
+                            CorrelationId = corr,
+                            WhenUtc = DateTime.UtcNow
+                        }).ConfigureAwait(false);
                     }
                     // ----- compute endpoints -----
                     else if (string.Equals(method, "POST", StringComparison.OrdinalIgnoreCase) && path == "/compute")
                     {
-                        // Body is the payload to "compute".
+                        // Body is the payload to "compute" (shape: App|Seq|args...)
                         string taskId = Guid.NewGuid().ToString("N");
                         _tasks.Enqueue((taskId, body ?? "", DateTime.UtcNow));
                         _taskSignal.Release();
@@ -346,7 +387,7 @@ namespace NodeAgent
             }
         }
 
-        // --- tiny executor simulating compute ---
+        // --- tiny executor simulating compute (now with real handlers) ---
         private async Task ExecLoopAsync()
         {
             FileLogger.Info("ExecLoop started");
@@ -361,14 +402,9 @@ namespace NodeAgent
                     (string TaskId, string Payload, DateTime EnqueuedUtc) item;
                     while (_tasks.TryDequeue(out item))
                     {
-                        // Simulate doing the work
-                        FileLogger.Info($"Executing task {item.TaskId} …");
-                        await Task.Delay(50).ConfigureAwait(false);
-
-                        // Send a canonical result line that your Master already understands
-                        // If payloads are of the form "QuickSmoke|0|noop" you’ll see the ticks appear.
-                        _comm.SendToMaster($"ComputeResult:{item.Payload}:OK");
-                        FileLogger.Info($"Task {item.TaskId} completed -> ComputeResult:{item.Payload}:OK");
+                        FileLogger.Info($"Executing task {item.TaskId} payload=\"{item.Payload}\"");
+                        // Process workload based on payload (App|Seq|args...)
+                        ProcessComputePayload(item.Payload);
                     }
                 }
                 catch (OperationCanceledException)
@@ -381,6 +417,95 @@ namespace NodeAgent
                 }
             }
             FileLogger.Info("ExecLoop exited");
+        }
+
+        // Parse and execute known workloads; fall back to legacy OK
+        private void ProcessComputePayload(string payload)
+        {
+            try
+            {
+                string app = "";
+                int seq = 0;
+                string args = "";
+
+                var parts = (payload ?? "").Split('|');
+                if (parts.Length >= 1) app = parts[0];
+                if (parts.Length >= 2) int.TryParse(parts[1], out seq);
+                if (parts.Length >= 3) args = string.Join("|", parts.Skip(2));
+
+                if (app.Equals("QuickSmoke", StringComparison.OrdinalIgnoreCase))
+                {
+                    // tiny success to light the ✓ column
+                    _comm.SendToMaster($"ComputeResult:{app}|{seq}:OK");
+                    _comm.SendToMaster($"Result:OK:{app}|{seq}");
+                    return;
+                }
+                else if (app.Equals("DemoHash", StringComparison.OrdinalIgnoreCase))
+                {
+                    int bytes = ParseIntArg(args, "bytes", 8 * 1024 * 1024);
+                    var hex = ComputeHash(seq, bytes);
+                    _comm.SendToMaster($"ComputeResult:{app}|{seq}:{hex}");
+                    _comm.SendToMaster($"Result:OK:{app}|{seq}");
+                    return;
+                }
+                else if (app.Equals("Burn", StringComparison.OrdinalIgnoreCase))
+                {
+                    int ms = ParseIntArg(args, "ms", 500);
+                    BusyBurn(ms);
+                    _comm.SendToMaster($"ComputeResult:{app}|{seq}:OK");
+                    _comm.SendToMaster($"Result:OK:{app}|{seq}");
+                    return;
+                }
+
+                // Legacy fallback: echo payload as the "job id"
+                _comm.SendToMaster($"ComputeResult:{payload}:OK");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Warn("ProcessComputePayload error", ex);
+                try { _comm.SendToMaster($"ComputeResult:{payload}:ERR:{Sanitize(ex.Message)}"); } catch { }
+            }
+        }
+
+        // --- helpers for workloads ---
+
+        private static int ParseIntArg(string argString, string key, int fallback)
+        {
+            if (string.IsNullOrWhiteSpace(argString)) return fallback;
+            foreach (var tok in argString.Split(';', '|', ','))
+            {
+                var kv = tok.Split('=', 2);
+                if (kv.Length == 2 &&
+                    kv[0].Trim().Equals(key, StringComparison.OrdinalIgnoreCase) &&
+                    int.TryParse(kv[1].Trim(), out var val))
+                {
+                    return val;
+                }
+            }
+            return fallback;
+        }
+
+        private static string ComputeHash(int seq, int bytes)
+        {
+            if (bytes < 0) bytes = 0;
+            var data = new byte[bytes];
+            var rng = new Random(unchecked(137 * (seq + 1)));
+            rng.NextBytes(data);
+            using var sha = SHA256.Create();
+            var hash = sha.ComputeHash(data);
+            return BitConverter.ToString(hash).Replace("-", "");
+        }
+
+        private static void BusyBurn(int milliseconds)
+        {
+            if (milliseconds <= 0) return;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            double x = 0;
+            while (sw.ElapsedMilliseconds < milliseconds)
+            {
+                x += 1.0;
+                if (x > 1e9) x = 0;
+            }
         }
 
         // --- HTTP response helpers (keep simple, C# 12 safe) ---
@@ -579,6 +704,8 @@ namespace NodeAgent
         }
     }
 }
+
+
 
 
 
