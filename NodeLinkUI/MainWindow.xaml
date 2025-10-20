@@ -127,43 +127,46 @@
                       HeadersVisibility="Column"
                       SelectionMode="Extended"
                       GridLinesVisibility="None"
-                      RowHeaderWidth="0">
+                      RowHeaderWidth="0" SelectionChanged="NodeGrid_SelectionChanged_1">
                 <DataGrid.Columns>
-                    <DataGridTextColumn Header="Agent" Binding="{Binding AgentId}" Width="200"/>
+                    <DataGridTextColumn Header="Agent" Binding="{Binding AgentId}" Width="150"/>
                     <!-- Agent IP moved to column 2 -->
-                    <DataGridTextColumn Header="IP" Binding="{Binding IpAddress}" Width="130"/>
+                    <DataGridTextColumn Header="IP" Binding="{Binding IpAddress}" Width="70"/>
 
-                    <DataGridCheckBoxColumn Header="Reg" Binding="{Binding Registered}" Width="60"/>
-                    <DataGridCheckBoxColumn Header="Online" Binding="{Binding IsOnline}" Width="70"/>
-                    <DataGridCheckBoxColumn Header="Degraded" Binding="{Binding IsDegraded}" Width="80"/>
+                    <DataGridCheckBoxColumn Header="Reg" Binding="{Binding Registered}" Width="40"/>
+                    <DataGridCheckBoxColumn Header="Online" Binding="{Binding IsOnline}" Width="40"/>
+                    <DataGridCheckBoxColumn Header="Degraded" Binding="{Binding IsDegraded}" Width="55"/>
 
-                    <DataGridTextColumn Header="CPU %" Binding="{Binding CpuUsagePercent, StringFormat=F0}" Width="70"/>
-                    <DataGridTextColumn Header="GPU %" Binding="{Binding GpuUsagePercent, StringFormat=F0}" Width="70"/>
-                    <DataGridTextColumn Header="Mem MB" Binding="{Binding MemoryAvailableMB, StringFormat=F0}" Width="90"/>
-                    <DataGridTextColumn Header="Q" Binding="{Binding TaskQueueLength}" Width="40"/>
-
-                    <!-- Latency + Threads -->
-                    <DataGridTextColumn Header="Latency ms" Binding="{Binding LastLatencyMs, StringFormat=F1}" Width="100"/>
-                    <DataGridTextColumn Header="Threads" Binding="{Binding SoftThreadsQueued}" Width="80"/>
+                    <DataGridTextColumn Header="CPU %" Binding="{Binding CpuUsagePercent, StringFormat=F0}" Width="50"/>
+                    <DataGridTextColumn Header="GPU %" Binding="{Binding GpuUsagePercent, StringFormat=F0}" Width="50"/>
+                    <DataGridTextColumn Header="Cores" Binding="{Binding CpuLogicalCores}" Width="30"/>
+                    <DataGridTextColumn Header="Mem/MB" Binding="{Binding MemoryAvailableMB, StringFormat=F0}" Width="60"/>
+                    <DataGridCheckBoxColumn Header="GPU" Binding="{Binding HasGpu}" Width="30"/>
+                    <DataGridTextColumn Header="GPU Model" Binding="{Binding GpuModel}" Width="80"/><DataGridTextColumn Header="Q" Binding="{Binding TaskQueueLength}" Width="40"/>
+                    <DataGridTextColumn Header="VRAM" Binding="{Binding GpuMemoryMB}" Width="90"/>
+                    <!-- Latency + Threads not used -->
+                    <!--DataGridTextColumn Header="Latency ms" Binding="{Binding LastLatencyMs, StringFormat=F1}" Width="10"/-->
+                    <!--DataGridTextColumn Header="Threads" Binding="{Binding SoftThreadsQueued}" Width="10"/-->
 
                     <!-- Throughput columns collapsed by default -->
                     <DataGridTextColumn x:Name="NetCol" Header="Net MB/s" Binding="{Binding NetworkMbps, StringFormat=F1}" Width="90" Visibility="Collapsed"/>
                     <DataGridTextColumn x:Name="RCol" Header="R MB/s" Binding="{Binding DiskReadMBps, StringFormat=F1}" Width="80" Visibility="Collapsed"/>
                     <DataGridTextColumn x:Name="WCol" Header="W MB/s" Binding="{Binding DiskWriteMBps, StringFormat=F1}" Width="80" Visibility="Collapsed"/>
 
-                    <DataGridTextColumn Header="Last Beat" Binding="{Binding LastHeartbeat, StringFormat=T}" Width="110"/>
+                    <DataGridTextColumn Header="Last Beat" Binding="{Binding LastHeartbeat, StringFormat=T}" Width="10"/>
                     <DataGridTextColumn Header="Test" Binding="{Binding SelfTestStatus}" Width="60"/>
-                    <DataGridTextColumn Header="Last Compute" Binding="{Binding LastComputeResult}" Width="220"/>
-                    <DataGridTextColumn Header="At" Binding="{Binding LastComputeAt, StringFormat=T}" Width="90"/>
+                    <!--DataGridTextColumn Header="Last Compute" Binding="{Binding LastComputeResult}" Width="20"/-->
+                    <DataGridTextColumn Header="At" Binding="{Binding LastComputeAt, StringFormat=T}" Width="10"/>
 
-                    <DataGridTextColumn Header="Cores" Binding="{Binding CpuLogicalCores}" Width="60"/>
-                    <DataGridCheckBoxColumn Header="GPU" Binding="{Binding HasGpu}" Width="60"/>
-                    <DataGridTextColumn Header="GPU Model" Binding="{Binding GpuModel}" Width="180"/>
-                    <DataGridTextColumn Header="VRAM MB" Binding="{Binding GpuMemoryMB}" Width="90"/>
-                    <DataGridTextColumn Header="GPUs" Binding="{Binding GpuCount}" Width="60"/>
+                    <DataGridTextColumn Header="RTT(ms)" Binding="{Binding LastLatencyMs}" Width="70" />
+                    <DataGridTextColumn Header="RTT Avg(ms)" Binding="{Binding AvgLatencyMs, StringFormat={}{0:N0}}" Width="90" />
+                    <DataGridTextColumn Header="Q/Wait(ms)" Binding="{Binding LastQueueWaitMs}" Width="70" />
+                    <DataGridTextColumn Header="Q/Wait Avg(ms)" Binding="{Binding AvgQueueWaitMs, StringFormat={}{0:N0}}" Width="90" />
 
+                                                           
+                    <!--DataGridTextColumn Header="GPUs" Binding="{Binding GpuCount}" Width="60"/-->
                     <!-- Removed old IP column at end -->
-                    <DataGridTextColumn Header="Instance" Binding="{Binding InstanceId}" Width="200"/>
+                    <!--DataGridTextColumn Header="Instance" Binding="{Binding InstanceId}" Width="200"/-->
                 </DataGrid.Columns>
             </DataGrid>
         </Border>

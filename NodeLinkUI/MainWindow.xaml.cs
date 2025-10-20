@@ -414,8 +414,7 @@ namespace NodeLinkUI
 
                     // Simple rolling average using Samples counter
                     var n = Math.Max(0, row.Samples);
-                    if (n == 0) row.AvgLatencyMs = ms;
-                    else row.AvgLatencyMs = (row.AvgLatencyMs * n + ms) / (n + 1);
+                    row.AvgLatencyMs = (n == 0) ? ms : (row.AvgLatencyMs * n + ms) / (n + 1);
                     row.Samples = n + 1;
 
                     // Optional: stamp last compute time / quick visual cues
@@ -425,6 +424,28 @@ namespace NodeLinkUI
                     RefreshGridPreservingSelection();
                 });
             };
+
+            // NEW: QueueWait (enqueue -> dispatch-now) measured on Node Manager
+            _orchestrator.QueueWaitMeasured += (agentId, app, seq, qms) =>
+            {
+                OnUI(() =>
+                {
+                    var row = agentStatuses.FirstOrDefault(a =>
+                        a.AgentId.Equals(agentId, StringComparison.OrdinalIgnoreCase));
+                    if (row == null) return;
+
+                    // qms (double) -> long for display
+                    row.LastQueueWaitMs = (long)Math.Round(qms);
+
+                    // Simple rolling average with its own counter
+                    var n = Math.Max(0, row.QueueSamples);
+                    row.AvgQueueWaitMs = (n == 0) ? qms : (row.AvgQueueWaitMs * n + qms) / (n + 1);
+                    row.QueueSamples = n + 1;
+
+                    RefreshGridPreservingSelection();
+                });
+            };
+
         }
 
 
@@ -1916,6 +1937,11 @@ namespace NodeLinkUI
 
         private void NodeGrid_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
+        }
+
+        private void NodeGrid_SelectionChanged_1(object sender, SelectionChangedEventArgs e)
+        {
+
         }
     }
 }

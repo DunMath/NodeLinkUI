@@ -120,6 +120,12 @@ namespace NodeCore
         private int _samples;
         public int Samples { get => _samples; set => Set(ref _samples, value); }
 
+        // --- P0: manager dwell (enqueue -> dispatch-now) ---
+        public long LastQueueWaitMs { get; set; }
+        public double AvgQueueWaitMs { get; set; }
+        public int QueueSamples { get; set; }
+
+
         public event PropertyChangedEventHandler? PropertyChanged;
 
         private void OnPropertyChanged([CallerMemberName] string? prop = null)
