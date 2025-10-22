@@ -1,123 +1,126 @@
-﻿using System;
+﻿// NodeCore/Orchestration/Orchestrator.cs
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
-using NodeCore; // AgentStatus
-// Uses TaskUnit / ResultEnvelope / TaskWire from NodeCore.Orchestration.TaskContracts
+using System.Threading;
+using NodeCore;                     // AgentStatus
+using NodeCore.Orchestration;       // TaskUnit (from TaskContracts) if present
 
 namespace NodeCore.Orchestration
 {
+    /// <summary>
+    /// Manager-side timing core (metrics-first).
+    /// - EnqueueStamp(...) optionally marks enqueue time per (agent, app, seq).
+    /// - MarkSentNow(...) must be called immediately before the actual socket write
+    ///   (stops QueueWait, starts RTT).
+    /// - OnResult(...) is called when a result/part arrives (stops RTT).
+    /// Emits QueueWaitMeasured (enqueue->send) and LatencyMeasured (send->result).
+    /// 
+    /// Back-compat:
+    /// - DispatchRequested event kept (obsolete) so existing UI can still perform the send.
+    /// - Submit(app,tasks) shim retained to avoid breaking callers; it raises DispatchRequested.
+    /// </summary>
     public interface IOrchestrator
     {
-        // Submit work and feed results back
-        void Submit(string runId, IReadOnlyList<TaskUnit> tasks);
-        void OnResult(ResultEnvelope result);
-
-        // Host (existing path) must actually deliver the payload to the agent
-        event Action<string /*agentId*/, string /*corrId*/, string /*payload*/>? DispatchRequested;
-
-        // P0 metrics (manager-measured):
-        //   RTT = dispatch-now -> result received
+        // Metrics (manager-measured)
         event Action<string /*agentId*/, string /*app*/, int /*seq*/, double /*rttMs*/>? LatencyMeasured;
-        //   QueueWait = enqueue -> dispatch-now
         event Action<string /*agentId*/, string /*app*/, int /*seq*/, double /*queueMs*/>? QueueWaitMeasured;
 
-        // P0: invoked at the moment we consider the unit "sent now".
-        // In P0 this is called inside TryPump (just before DispatchRequested).
-        // In P1 you can move the call to the actual socket write site.
+        // Called immediately BEFORE the actual write to the agent.
         void MarkSentNow(string agentId, string corrIdOrNull, string? wirePayload = null);
+
+        // Called when a result/part envelope is accepted by the manager.
+        void OnResult(ResultEnvelope result);
     }
 
     /// <summary>
-    /// Default scheduler:
-    ///  - Chooses eligible agents (Registered + Online)
-    ///  - Distributes work (affinity if set; else round-robin)
-    ///  - Per-agent queue + in-flight cap
-    ///  - Pumps when results arrive
-    ///  - P0: measures QueueWait (enqueue->dispatch-now) and RTT (dispatch-now->result) on the manager
+    /// DefaultOrchestrator: single source of truth for QueueWait/RTT on the manager.
+    /// Now metrics-first; dispatch path is raised via obsolete DispatchRequested for UI compatibility.
     /// </summary>
     public sealed class DefaultOrchestrator : IOrchestrator
     {
+        // Optional snapshot (kept so ctor signature remains compatible)
         private readonly Func<List<AgentStatus>> _snapshotAgents;
 
-        // Per-agent FIFO of (runId, task)
-        private readonly ConcurrentDictionary<string, ConcurrentQueue<(string runId, TaskUnit unit)>> _perAgentQueues = new();
-
-        // Tracks how many tasks are in-flight per agent
-        private readonly Dictionary<string, int> _inflight = new(StringComparer.OrdinalIgnoreCase);
-
-        // ================= P0 metrics state =================
-
-        // enqueue -> dispatch-now dwell (manager-side), keyed by seq::<agentId>::<app>::<seq>
+        // enqueue → actual send (QueueWait), keyed by seq::<agentId>::<app>::<seq>
         private readonly ConcurrentDictionary<string, DateTime> _enqueuedAtBySeqKey = new();
 
-        // dispatch-now -> result (RTT). Keys: corr::<corrId> or seq::<agentId>::<app>::<seq>
+        // actual send → result (RTT). Keys: corr::<corrId> OR seq::<agentId>::<app>::<seq>
         private readonly ConcurrentDictionary<string, DateTime> _sentAtByKey = new();
 
-        // Per-agent EWMA of RTT
+        // Per-agent RTT EWMA (for later scheduling decisions)
         private readonly Dictionary<string, double> _emaMs = new(StringComparer.OrdinalIgnoreCase);
+        private readonly object _emaGate = new();
 
-        // Gate for inflight/ema decisions
-        private readonly object _gate = new();
-
-        // ================= Events =================
-
-        public event Action<string, string, string>? DispatchRequested;
         public event Action<string, string, int, double>? LatencyMeasured;
         public event Action<string, string, int, double>? QueueWaitMeasured;
 
-        /// <summary>How many outstanding tasks we allow per agent (default 1).</summary>
+        /// <summary>
+        /// Back-compat: the UI may still be subscribed to this to perform the actual send.
+        /// Prefer to call MarkSentNow(...) from the real send site and remove this event later.
+        /// </summary>
+        [Obsolete("Use direct send with MarkSentNow(...) instead; this is kept for UI compatibility.")]
+        public event Action<string /*agentId*/, string /*corrId*/, string /*payload*/>? DispatchRequested;
+
+        // Kept for signature compatibility; not used for metrics.
         public int MaxOutstandingPerAgent { get; }
 
         public DefaultOrchestrator(Func<List<AgentStatus>> snapshotAgents, int maxOutstandingPerAgent = 1)
         {
-            _snapshotAgents = snapshotAgents ?? throw new ArgumentNullException(nameof(snapshotAgents));
-            if (maxOutstandingPerAgent <= 0) maxOutstandingPerAgent = 1;
-            MaxOutstandingPerAgent = maxOutstandingPerAgent;
+            if (snapshotAgents == null) throw new ArgumentNullException(nameof(snapshotAgents));
+            _snapshotAgents = snapshotAgents;
+            MaxOutstandingPerAgent = Math.Max(1, maxOutstandingPerAgent);
         }
 
-        // ================= Public API =================
-
-        public void Submit(string runId, IReadOnlyList<TaskUnit> tasks)
+        /// <summary>
+        /// Optional: stamp the enqueue moment so QueueWait can be measured (enqueue → actual send).
+        /// If not stamped, QueueWait will emit 0 when MarkSentNow fires.
+        /// </summary>
+        public void EnqueueStamp(string agentId, string app, int seq)
         {
-            if (string.IsNullOrWhiteSpace(runId) || tasks == null || tasks.Count == 0)
-                return;
+            if (string.IsNullOrWhiteSpace(agentId) || string.IsNullOrWhiteSpace(app)) return;
+            _enqueuedAtBySeqKey[SeqKey(agentId, app, seq)] = DateTime.UtcNow;
+        }
 
-            // Eligible agents ordered by light load signals
-            var agents = _snapshotAgents()
-                .Where(a => a.Registered && a.IsOnline)
-                .OrderBy(a => a.TaskQueueLength)
-                .ThenBy(a => a.CpuUsagePercent)
-                .ToList();
+        /// <summary>
+        /// Must be called immediately before the wire write to the agent.
+        /// - Stops QueueWait (if stamped) and emits QueueWaitMeasured.
+        /// - Starts RTT (by corrId if present; also by seq as fallback if we can parse app/seq).
+        /// </summary>
+        public void MarkSentNow(string agentId, string corrIdOrNull, string? wirePayload = null)
+        {
+            var now = DateTime.UtcNow;
 
-            if (agents.Count == 0)
-                return;
+            // Start RTT (corrId if present)
+            if (!string.IsNullOrWhiteSpace(corrIdOrNull))
+                _sentAtByKey[CorrKey(corrIdOrNull!)] = now;
 
-            int rr = 0;
-
-            foreach (var t in tasks)
+            // If we can parse app/seq from the outgoing payload, also:
+            //  - emit QueueWait, and
+            //  - start RTT keyed by seq as a fallback (in case CorrId is not echoed).
+            if (!string.IsNullOrWhiteSpace(wirePayload) &&
+                TryParseAppSeqFromWire(wirePayload!, out var app, out var seq))
             {
-                // Honor affinity if provided
-                var target = !string.IsNullOrWhiteSpace(t.AffinityAgentId)
-                    ? agents.FirstOrDefault(a => string.Equals(a.AgentId, t.AffinityAgentId, StringComparison.OrdinalIgnoreCase))
-                    : null;
+                var skey = SeqKey(agentId, app, seq);
 
-                // Otherwise round-robin
-                target ??= agents[rr++ % agents.Count];
+                double qms = 0;
+                if (_enqueuedAtBySeqKey.TryRemove(skey, out var tEnq))
+                    qms = Math.Max(0, (now - tEnq).TotalMilliseconds);
 
-                // Enqueue to that agent
-                var q = _perAgentQueues.GetOrAdd(target.AgentId, _ => new ConcurrentQueue<(string, TaskUnit)>());
-                q.Enqueue((runId, t));
+                // Always emit a QueueWait sample (0 if no enqueue recorded) to keep UI fresh.
+                try { QueueWaitMeasured?.Invoke(agentId, app, seq, qms); } catch { }
+                Debug.WriteLine($"[QueueWait] {agentId} {app}|{seq} = {qms:n0} ms");
 
-                // P0: remember when we enqueued (for QueueWait)
-                _enqueuedAtBySeqKey[SeqKey(target.AgentId, t.App, t.Seq)] = DateTime.UtcNow;
-
-                // Try to pump to this agent (respecting cap)
-                TryPump(target.AgentId);
+                // Track RTT by seq as a backup in case corrId is absent on result.
+                _sentAtByKey[skey] = now;
             }
         }
 
+        /// <summary>
+        /// Stop RTT on result; also updates per-agent EWMA. Emits LatencyMeasured.
+        /// </summary>
         public void OnResult(ResultEnvelope result)
         {
             if (result == null) return;
@@ -125,7 +128,7 @@ namespace NodeCore.Orchestration
             string agentId = result.AgentId ?? result.SenderId ?? string.Empty;
             if (string.IsNullOrWhiteSpace(agentId)) return;
 
-            // Robust t0 extraction (corrId preferred; seq-key fallback)
+            // Complete RTT
             DateTime t0 = default;
             bool found = false;
 
@@ -139,7 +142,7 @@ namespace NodeCore.Orchestration
             {
                 var ms = Math.Max(0, (DateTime.UtcNow - t0).TotalMilliseconds);
 
-                lock (_gate)
+                lock (_emaGate)
                 {
                     if (_emaMs.TryGetValue(agentId, out var ema))
                         _emaMs[agentId] = ema * 0.8 + ms * 0.2;
@@ -150,98 +153,45 @@ namespace NodeCore.Orchestration
                 try { LatencyMeasured?.Invoke(agentId, result.App!, result.Seq, ms); } catch { }
                 Debug.WriteLine($"[RTT] {agentId} {result.App}|{result.Seq} = {ms:n0} ms");
             }
-
-            // Free one slot and continue pumping
-            lock (_gate)
-            {
-                if (_inflight.TryGetValue(agentId, out var n) && n > 0)
-                    _inflight[agentId] = n - 1;
-            }
-
-            TryPump(agentId);
         }
 
         /// <summary>
-        /// P0: mark the *dispatch-now* moment and compute QueueWait if possible.
-        /// In P1, move this call to the actual socket write to exclude any remaining dwell.
+        /// UI/back-compat shim: keep older callers happy while we migrate dispatch.
+        /// It stamps QueueWait start and raises DispatchRequested with a single runId.
+        /// NOTE: TaskUnit does NOT carry AgentId; we pick an agent from the snapshot (simple RR).
         /// </summary>
-        public void MarkSentNow(string agentId, string corrIdOrNull, string? wirePayload = null)
+        public void Submit(string app, IReadOnlyList<TaskUnit> tasks)
         {
-            var now = DateTime.UtcNow;
+            if (string.IsNullOrWhiteSpace(app) || tasks == null || tasks.Count == 0) return;
 
-            if (!string.IsNullOrWhiteSpace(corrIdOrNull))
-                _sentAtByKey[CorrKey(corrIdOrNull!)] = now;
+            // One correlation per submit (legacy behavior)
+            string runId = Guid.NewGuid().ToString("N");
 
-            // If we can parse App|Seq from the wire, compute QueueWait and store seq-key send time too
-            if (!string.IsNullOrWhiteSpace(wirePayload) &&
-                TryParseAppSeqFromWire(wirePayload!, out var app, out var seq))
+            var agents = SafeSnapshotAgents();
+            if (agents.Count == 0) return;
+
+            foreach (var t in tasks)
             {
-                var skey = SeqKey(agentId, app, seq);
+                var agent = PickAgent(agents);
+                var agentId = agent.AgentId;
 
-                // QueueWait = enqueue -> dispatch-now
-                if (_enqueuedAtBySeqKey.TryRemove(skey, out var tEnq))
-                {
-                    var qms = Math.Max(0, (now - tEnq).TotalMilliseconds);
-                    try { QueueWaitMeasured?.Invoke(agentId, app, seq, qms); } catch { }
-                    Debug.WriteLine($"[QueueWait] {agentId} {app}|{seq} = {qms:n0} ms");
-                }
+                // record enqueue time for QueueWait (keyed by agent+app+seq)
+                _enqueuedAtBySeqKey[SeqKey(agentId, app, t.Seq)] = DateTime.UtcNow;
 
-                // Also store send start by seq-key (legacy corrId-less agents)
-                _sentAtByKey[skey] = now;
+                // build legacy wire payload so existing agents still respond
+                // (Compute path remains as a compatibility test harness)
+                string payload = $"Compute:{app}|{t.Seq}|{t.Payload ?? ""}";
+
+                try { DispatchRequested?.Invoke(agentId, runId, payload); } catch { }
             }
         }
 
-        // ================= Internals =================
-
-        private void TryPump(string agentId)
-        {
-            // We may send multiple units if cap allows
-            while (true)
-            {
-                (string runId, TaskUnit unit)? dequeued = null;
-
-                lock (_gate)
-                {
-                    // Respect in-flight cap
-                    _inflight.TryGetValue(agentId, out var inFlightNow);
-                    if (inFlightNow >= MaxOutstandingPerAgent)
-                        break;
-
-                    if (!_perAgentQueues.TryGetValue(agentId, out var q) || !q.TryDequeue(out var item))
-                        break; // nothing to send
-
-                    // Reserve a slot
-                    _inflight[agentId] = inFlightNow + 1;
-                    dequeued = item;
-                }
-
-                // Build wire outside the lock
-                var (runId, unit) = dequeued.Value;
-
-                // Unique correlation id per dispatch
-                var corrId = $"{unit.App}-{unit.Seq}-{Guid.NewGuid():N}";
-                var sentUtc = DateTime.UtcNow; // informational; RTT start is below
-
-                unit.CorrId = corrId;
-                unit.SentUtc = sentUtc;
-
-                // Wire shape stays backward-compatible (Compute:App|Seq|...)
-                var payload = TaskWire.ToWire(unit);
-
-                // P0: treat THIS as "dispatch-now" (start RTT + emit QueueWait)
-                MarkSentNow(agentId, corrId, payload);
-
-                // Existing pathway: host delivers the payload (whatever threads/queues exist today)
-                try { DispatchRequested?.Invoke(agentId, corrId, payload); } catch { }
-
-                // Loop again if cap > 1
-            }
-        }
+        // --------- helpers ---------
 
         private static string CorrKey(string corrId) => $"corr::{corrId}";
         private static string SeqKey(string agentId, string app, int seq) => $"seq::{agentId}::{app}::{seq}";
 
-        // Parses "Compute:App|Seq|..." to extract app+seq from the wire
+        // Parses both "AppRun:App|Seq|..." and "Compute:App|Seq|..." to extract app+seq from the wire.
         private static bool TryParseAppSeqFromWire(string wire, out string app, out int seq)
         {
             app = ""; seq = 0;
@@ -259,8 +209,47 @@ namespace NodeCore.Orchestration
             }
             return false;
         }
+
+        /// <summary>
+        /// Optional accessor if you want to display per-agent EWMA RTT in the UI later.
+        /// </summary>
+        public double? TryGetAgentEwmaMs(string agentId)
+        {
+            if (string.IsNullOrWhiteSpace(agentId)) return null;
+            lock (_emaGate) return _emaMs.TryGetValue(agentId, out var v) ? v : (double?)null;
+        }
+
+        // ---- helpers for Submit() ----
+
+        private List<AgentStatus> SafeSnapshotAgents()
+        {
+            try
+            {
+                var list = _snapshotAgents?.Invoke() ?? new List<AgentStatus>();
+                return list.Where(a => !string.IsNullOrWhiteSpace(a.AgentId)).ToList();
+            }
+            catch { return new List<AgentStatus>(); }
+        }
+
+        private int _rrIndex = 0;
+
+        private AgentStatus PickAgent(List<AgentStatus> agents)
+        {
+            // Prefer online non-Master; fallback to any agent in the list
+            var pool = agents.Where(a => a.IsOnline && !string.Equals(a.AgentId, "Master", StringComparison.OrdinalIgnoreCase)).ToList();
+            if (pool.Count == 0) pool = agents;
+            if (pool.Count == 0) throw new InvalidOperationException("No agents available");
+
+            var idx = Math.Abs(Interlocked.Increment(ref _rrIndex));
+            return pool[idx % pool.Count];
+        }
     }
 }
+
+
+
+
+
 
 
 

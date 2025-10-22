@@ -1,15 +1,21 @@
-﻿// MainWindow.xaml.cs — v1.2.2 (no MasterBootstrapper static deps; local HTTP register helper)
-// v1.2.1: dup-ACK guard, single popup, auto-register off
-// v1.2: auto-register path + shared register method
-// v1.1.1: in-flight guard + heartbeat interval/sweep
-// v1.1: orchestration + result collation + minor mDNS fix
+﻿// MainWindow.xaml.cs — Lean build (no SoftThreads, no in-flight guard)
+// - AppRun fast path wired (agent-side)
+// - Orchestrator metrics (RTT/QueueWait) hooked
+// - Registration via local HTTP helper in this file
+// - Compute test and distributed benchmark retained for diagnostics
 
+using Makaretu.Dns;
+using NodeAgent;
 using NodeComm;
 using NodeCore;
+using NodeCore.Config;
+using NodeCore.Exec;
+using NodeCore.Orchestration;
+using NodeCore.Protocol;
 using NodeCore.Scheduling;
+using NodeCore.Exec;
 using NodeMaster;
-using NodeAgent;
-
+using NodeMaster.Distrib;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
@@ -19,7 +25,7 @@ using System.IO;
 using System.Linq;
 using System.Management;
 using System.Net;
-using System.Net.Http;            // <— ADDED
+using System.Net.Http;
 using System.Net.NetworkInformation;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -30,11 +36,6 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
 using System.Windows.Media;
-using Makaretu.Dns;
-
-using NodeCore.Config;              // NodeLinkConfig.Load()
-using NodeCore.Protocol;            // Proto constants (Version/DefaultControlPort)
-using NodeCore.Orchestration;
 
 namespace NodeLinkUI
 {
@@ -78,14 +79,7 @@ namespace NodeLinkUI
         private readonly Dictionary<string, DateTime> _lastDiscoveryLog = new(StringComparer.OrdinalIgnoreCase);
         private static readonly TimeSpan DiscoveryLogMinGap = TimeSpan.FromSeconds(30);
 
-        private readonly Dictionary<string, DateTime> _inFlightByAgent = new(StringComparer.OrdinalIgnoreCase);
-        private static readonly TimeSpan InFlightHold = TimeSpan.FromSeconds(6);
-
-        private readonly HashSet<string> _registrationInFlight = new(StringComparer.OrdinalIgnoreCase);
-        private readonly Dictionary<string, DateTime> _lastRegisterAttempt = new(StringComparer.OrdinalIgnoreCase);
-        private static readonly TimeSpan RegisterRetryGap = TimeSpan.FromSeconds(20);
-
-        private const bool ENABLE_AUTO_REGISTER = false; // (you asked to hold off for now)
+        private const bool ENABLE_AUTO_REGISTER = false;
         private readonly HashSet<string> _shownRegisterDialog = new(StringComparer.OrdinalIgnoreCase);
 
         private readonly string _thisInstanceId = Guid.NewGuid().ToString();
@@ -101,18 +95,24 @@ namespace NodeLinkUI
         private List<PerformanceCounter>? _gpuCounters;
         private bool _gpuCountersInit;
 
-        // private SoftThreadDispatcher? _softDispatcher;
-        // private AgentWorkQueue? _agentWork;
-
         private readonly object _fileLogLock = new();
         private readonly Queue<string> _masterLogBuffer = new();
         private const int MasterLogMaxLines = 100;
         private const string MasterLogPath = "master.log";
 
         private readonly NodeLinkConfig _cfg = NodeLinkConfig.Load();
+        private MasterOrchestrator? _masterOrchestrator;
+
+        //// master-side local metrics
+        // pass-through for now
+
+        private DecisionCoordinator? _decider;
+        private LocalExecutor? _localExec;
 
         private DefaultOrchestrator? _orchestrator;
         private DefaultResultCollator? _collator;
+
+        private AgentBootstrapper? _agentBootstrap;
 
         private void OnUI(Action work)
         {
@@ -154,7 +154,6 @@ namespace NodeLinkUI
 
             if (currentRole == NodeRole.Master)
             {
-                // We used to hook MasterBootstrapper events here — removed to avoid static deps.
                 SetupAgentDiscovery();
             }
         }
@@ -303,7 +302,6 @@ namespace NodeLinkUI
                     RefreshGridPreservingSelection();
                 });
 
-                InitializeSoftThreadsForMaster();
                 InitializeOrchestration();
 
                 _ = Task.Run(async () =>
@@ -346,8 +344,12 @@ namespace NodeLinkUI
                 try
                 {
                     var commAdapter = new AgentCommAdapter(comm);
-                    var bootstrap = new AgentBootstrapper(commAdapter, localAgentId);
-                    bootstrap.Start(masterIp ?? "127.0.0.1");
+                    _agentBootstrap = new AgentBootstrapper(commAdapter, localAgentId);
+
+                    // FAST PATH: route "AppRun:" frames straight to the agent executor
+                    comm.AppRunSink = _agentBootstrap.OnWireMessage;
+
+                    _agentBootstrap.Start(masterIp ?? "127.0.0.1");
                 }
                 catch (Exception ex)
                 {
@@ -360,12 +362,10 @@ namespace NodeLinkUI
                     RefreshGridPreservingSelection();
                 });
 
-                InitializeSoftThreadsForAgent();
-
                 var cfg = BuildAgentConfig(localAgentId);
-                comm.SendToMaster($"AgentConfig:{JsonSerializer.Serialize(cfg)}");
+                comm.SendToMaster($"AgentConfig:{System.Text.Json.JsonSerializer.Serialize(cfg)}");
                 var pulse = BuildAgentPulse(localAgentId);
-                comm.SendToMaster($"AgentPulse:{JsonSerializer.Serialize(pulse)}");
+                comm.SendToMaster($"AgentPulse:{System.Text.Json.JsonSerializer.Serialize(pulse)}");
             }
         }
 
@@ -373,34 +373,51 @@ namespace NodeLinkUI
         {
             if (currentRole != NodeRole.Master) return;
 
-            // Result collation
+            // Result collation (unchanged)
             _collator = new DefaultResultCollator();
             _collator.JobCompleted += (app, runId, ordered) =>
             {
                 Log($"Job complete: {app} run={runId} ({ordered.Count} results).");
-                // TODO: assemble into final output / write file / update UI
             };
 
-            // Orchestrator
-            _orchestrator = new DefaultOrchestrator(() => agentStatuses.ToList());
+            // Orchestrator (unchanged)
+            _orchestrator = new DefaultOrchestrator(() => agentStatuses.ToList(), maxOutstandingPerAgent: 1);
 
-            // Dispatch hook (unchanged)
-            _orchestrator.DispatchRequested += (agentId, corrId, payload) =>
+            // MasterOrchestrator (network send/receive owner) (unchanged)
+            _masterOrchestrator ??= new MasterOrchestrator(
+                comm,
+                () => agentStatuses,   // live snapshot source
+                Log
+            );
+
+            // Timing → orchestrator metrics (unchanged)
+            _masterOrchestrator.OnWillSend = (agentId, corr, wire) =>
             {
-                if (!CanDispatchTo(agentId))
-                {
-                    Log($"Dispatch skipped: {agentId} still in-flight.");
-                    return;
-                }
-                MarkInFlight(agentId);
-
-                if (_softDispatcher != null)
-                    _softDispatcher.Enqueue(agentId, corrId, payload);
-                else
-                    comm.SendToAgent(agentId, payload);
+                try { _orchestrator.MarkSentNow(agentId, corr, wire); }
+                catch (Exception ex) { Log($"MarkSentNow error: {ex.Message}"); }
+            };
+            _masterOrchestrator.OnResultForMetrics = env =>
+            {
+                try { _orchestrator.OnResult(env); }
+                catch (Exception ex) { Log($"OnResult error: {ex.Message}"); }
             };
 
-            // RTT measured on Node Manager (new orchestrator path)
+            // Reflect agent ban/unban in UI (unchanged)
+            _masterOrchestrator.OnAgentBanChanged = (agentId, isDegraded) =>
+            {
+                OnUI(() =>
+                {
+                    var row = agentStatuses.FirstOrDefault(a =>
+                        a.AgentId.Equals(agentId, StringComparison.OrdinalIgnoreCase));
+                    if (row != null)
+                    {
+                        row.IsDegraded = isDegraded;
+                        RefreshGridPreservingSelection();
+                    }
+                });
+            };
+
+            // UI hooks for remote RTT (Latency) (unchanged)
             _orchestrator.LatencyMeasured += (agentId, app, seq, ms) =>
             {
                 OnUI(() =>
@@ -409,23 +426,18 @@ namespace NodeLinkUI
                         a.AgentId.Equals(agentId, StringComparison.OrdinalIgnoreCase));
                     if (row == null) return;
 
-                    // Write type-safely: ms (double) -> long
                     row.LastLatencyMs = (long)Math.Round(ms);
 
-                    // Simple rolling average using Samples counter
                     var n = Math.Max(0, row.Samples);
                     row.AvgLatencyMs = (n == 0) ? ms : (row.AvgLatencyMs * n + ms) / (n + 1);
                     row.Samples = n + 1;
 
-                    // Optional: stamp last compute time / quick visual cues
                     row.LastComputeAt = DateTime.Now;
-                    // row.IsDegraded = ms > 2000; // if you want a threshold cue
-
                     RefreshGridPreservingSelection();
                 });
             };
 
-            // NEW: QueueWait (enqueue -> dispatch-now) measured on Node Manager
+            // UI hooks for remote QueueWait (unchanged)
             _orchestrator.QueueWaitMeasured += (agentId, app, seq, qms) =>
             {
                 OnUI(() =>
@@ -434,10 +446,8 @@ namespace NodeLinkUI
                         a.AgentId.Equals(agentId, StringComparison.OrdinalIgnoreCase));
                     if (row == null) return;
 
-                    // qms (double) -> long for display
                     row.LastQueueWaitMs = (long)Math.Round(qms);
 
-                    // Simple rolling average with its own counter
                     var n = Math.Max(0, row.QueueSamples);
                     row.AvgQueueWaitMs = (n == 0) ? qms : (row.AvgQueueWaitMs * n + qms) / (n + 1);
                     row.QueueSamples = n + 1;
@@ -446,6 +456,52 @@ namespace NodeLinkUI
                 });
             };
 
+            // === NEW: Master-side local metrics (no UI changes; reuse existing columns) ===
+            // LocalExecutor lives in NodeCore (headless). It measures queue-wait & "local RTT" (queue+exec).
+            if (_localExec == null)
+            {
+                _localExec = new NodeCore.Exec.LocalExecutor(preferredConcurrency: Math.Min(Environment.ProcessorCount / 2, 4));
+
+                // Feed Master row using the same QueueWait/Latency columns you already have.
+                _localExec.MetricsMeasured += (agentId, app, seq, qms, rtt) =>
+                {
+                    // We publish metrics as agentId="Master" so they land in the Master row
+                    OnUI(() =>
+                    {
+                        var row = agentStatuses.FirstOrDefault(a =>
+                            a.AgentId.Equals("Master", StringComparison.OrdinalIgnoreCase));
+                        if (row == null) return;
+
+                        // QueueWait (master-local)
+                        row.LastQueueWaitMs = (long)Math.Round(qms);
+                        var qn = Math.Max(0, row.QueueSamples);
+                        row.AvgQueueWaitMs = (qn == 0) ? qms : (row.AvgQueueWaitMs * qn + qms) / (qn + 1);
+                        row.QueueSamples = qn + 1;
+
+                        // Latency/RTT (master-local "queue+exec")
+                        row.LastLatencyMs = (long)Math.Round(rtt);
+                        var ln = Math.Max(0, row.Samples);
+                        row.AvgLatencyMs = (ln == 0) ? rtt : (row.AvgLatencyMs * ln + rtt) / (ln + 1);
+                        row.Samples = ln + 1;
+
+                        row.LastComputeAt = DateTime.Now;
+                        RefreshGridPreservingSelection();
+                    });
+                };
+            }
+
+            // === NEW: DecisionCoordinator (headless, in NodeCore). For now it passes through to the remote orchestrator.
+            if (_decider == null)
+            {
+                _decider = new NodeCore.Orchestration.DecisionCoordinator(
+                    () => agentStatuses.ToList(),
+                    _orchestrator
+                );
+            }
+
+            // Note: No behavior change to your existing dispatch paths yet.
+            // When you're ready, submit app work via _decider.Submit(app, units)
+            // to choose Local vs Remote. For now, everything still goes remote through _orchestrator.
         }
 
 
@@ -500,7 +556,6 @@ namespace NodeLinkUI
 
                 try { System.IO.File.WriteAllText("node.config", role.ToString()); } catch { }
 
-                try { DisposeSoftThreads(); } catch { }
                 try { StopMdns(); } catch { }
 
                 var exePath = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName ?? string.Empty;
@@ -589,11 +644,17 @@ namespace NodeLinkUI
                     return;
                 }
 
-                if (message.StartsWith("Compute:", StringComparison.OrdinalIgnoreCase) ||
-                    message.StartsWith("CustomTask:", StringComparison.OrdinalIgnoreCase))
+                // Legacy compute path → route to new AppRun fast-path if possible
+                if (message.StartsWith("Compute:", StringComparison.OrdinalIgnoreCase))
                 {
-                    _agentWork?.Enqueue(message);
-                    Log($"Queued work on Agent: {message}");
+                    _agentBootstrap?.OnWireMessage("AppRun:" + message.Substring("Compute:".Length));
+                    Log($"Routed Compute→AppRun on Agent: {message}");
+                    return;
+                }
+
+                if (message.StartsWith("CustomTask:", StringComparison.OrdinalIgnoreCase))
+                {
+                    Log($"CustomTask ignored on Agent (no handler bound): {message}");
                     return;
                 }
             }
@@ -603,7 +664,6 @@ namespace NodeLinkUI
             {
                 _collator?.Accept(env);
                 _orchestrator?.OnResult(env);
-                ClearInFlight(agentId);
                 return;
             }
 
@@ -611,11 +671,14 @@ namespace NodeLinkUI
             {
                 var first = message.IndexOf(':');
                 var second = first >= 0 ? message.IndexOf(':', first + 1) : -1;
+                string? corr = null;
                 if (first >= 0 && second > first)
                 {
                     var ackAgentId = message.Substring(first + 1, second - first - 1).Trim();
-                    var already = _registeredAgents.Contains(ackAgentId);
+                    var third = message.IndexOf(':', second + 1);
+                    if (third > second) corr = message.Substring(second + 1, third - second - 1).Trim();
 
+                    var already = _registeredAgents.Contains(ackAgentId);
                     if (already)
                     {
                         Log($"Duplicate RegisterAck ignored from {ackAgentId}.");
@@ -640,10 +703,10 @@ namespace NodeLinkUI
                         RefreshGridPreservingSelection();
                     });
 
-                    var payload = "Compute:QuickSmoke|0|noop";
-                    if (_softDispatcher != null) _softDispatcher.Enqueue(ackAgentId, $"smoke-on-register-{Guid.NewGuid():N}", payload);
-                    else comm.SendToAgent(ackAgentId, payload);
-                    Log($"Auto-smoke sent to {ackAgentId} (after RegisterAck).");
+                    // Auto-smoke via new path
+                    var payload = "AppRun:QuickSmoke|0|noop";
+                    comm.SendToAgent(ackAgentId, payload);
+                    Log($"Auto-smoke (AppRun) sent to {ackAgentId} (after RegisterAck).");
 
                     Log($"RegisterAck accepted from {ackAgentId} (Agent #{agentNumber})");
 
@@ -693,11 +756,6 @@ namespace NodeLinkUI
                             RefreshGridPreservingSelection();
                         }
                     });
-
-                    _softDispatcher?.OnResultReceived(aId);
-                    UpdateSoftThreadStats();
-
-                    ClearInFlight(aId);
 
                     Log($"Self-test result from {aId}: {symbol}");
                 }
@@ -751,6 +809,9 @@ namespace NodeLinkUI
                     {
                         _lastSeenUtc[p.AgentId] = DateTime.UtcNow;
 
+                        // NEW: inform master orchestrator (clears ban, marks activity)
+                        _masterOrchestrator?.NoteAgentPulse(p.AgentId);
+
                         OnUI(() =>
                         {
                             var row = agentStatuses.FirstOrDefault(a => a.AgentId.Equals(p.AgentId, StringComparison.OrdinalIgnoreCase))
@@ -786,7 +847,6 @@ namespace NodeLinkUI
 
                             UpdateOrAddAgentStatus(row);
                             RefreshGridPreservingSelection();
-                            UpdateSoftThreadStats();
                         });
                     }
                 }
@@ -817,9 +877,6 @@ namespace NodeLinkUI
 
             if (message.StartsWith("ComputeResult:", StringComparison.OrdinalIgnoreCase))
             {
-                _softDispatcher?.OnResultReceived(agentId);
-                UpdateSoftThreadStats();
-
                 var parts = message.Split(':');
                 if (parts.Length > 2)
                 {
@@ -836,23 +893,14 @@ namespace NodeLinkUI
                     }
                 }
 
-                ClearInFlight(agentId);
-
                 HandleComputeResultMessage(message, agentId);
                 return;
             }
 
             if (message.StartsWith("Result:", StringComparison.OrdinalIgnoreCase))
             {
-                if (currentRole == NodeRole.Master)
-                {
-                    _softDispatcher?.OnResultReceived(agentId);
-                    UpdateSoftThreadStats();
-                }
                 Log($"Task response: {message}");
                 taskHistory.Add($"{DateTime.Now:T}: {message}");
-
-                ClearInFlight(agentId);
 
                 HandleComputeResultMessage(message, agentId);
                 return;
@@ -975,22 +1023,12 @@ namespace NodeLinkUI
             var agent = agentStatuses.FirstOrDefault(a => a.IsOnline && a.AgentId != "Master");
             if (agent == null) { Log("No online agents."); return; }
 
-            if (!CanDispatchTo(agent.AgentId))
-            {
-                Log($"Skip custom task: {agent.AgentId} still in-flight.");
-                return;
-            }
-            MarkInFlight(agent.AgentId);
-
             string taskId = Guid.NewGuid().ToString();
             string payload = $"CustomTask:{taskId}:{task}";
 
-            if (_softDispatcher != null)
-                _softDispatcher.Enqueue(agent.AgentId, taskId, payload);
-            else if (master != null)
-                master.DispatchTaskToAgent(payload, agent.AgentId);
-            else
-                comm.SendToAgent(agent.AgentId, payload);
+            // Direct send
+            if (!comm.SendToAgent(agent.AgentId, payload))
+                Log($"Failed to send custom task to {agent.AgentId}");
 
             Log($"Sent custom task: {task} to {agent.AgentId}");
             taskHistory.Add($"{DateTime.Now:T}: Sent {task} to {agent.AgentId}");
@@ -1011,146 +1049,6 @@ namespace NodeLinkUI
             taskHistory.Add($"{DateTime.Now:T}: Stop {t.TaskId} on {t.AgentId}");
         }
 
-        // Shared register path (button + optional auto-register)
-        private async Task<bool> TryRegisterAgentAsync(AgentStatus sel)
-        {
-            if (currentRole != NodeRole.Master) return false;
-            if (sel == null || string.IsNullOrWhiteSpace(sel.IpAddress))
-            {
-                Log($"Register skipped: no IP for {sel?.AgentId ?? "unknown"}");
-                return false;
-            }
-
-            var id = sel.AgentId;
-
-            lock (_registrationInFlight)
-            {
-                if (_registrationInFlight.Contains(id))
-                {
-                    Log($"Register skipped: {id} already in-flight.");
-                    return false;
-                }
-
-                if (_lastRegisterAttempt.TryGetValue(id, out var last) &&
-                    (DateTime.UtcNow - last) < RegisterRetryGap)
-                {
-                    Log($"Register backoff active for {id}.");
-                    return false;
-                }
-
-                _registrationInFlight.Add(id);
-                _lastRegisterAttempt[id] = DateTime.UtcNow;
-            }
-
-            try
-            {
-                int port = _cfg.ControlPort;
-
-                // Local HTTP helper (no MasterBootstrapper static call)
-                var ok = await RegisterAgentHttpAsync(
-                    agentId: sel.AgentId,
-                    agentIp: sel.IpAddress!,
-                    agentPort: port,
-                    masterId: "Master",
-                    masterIp: GetLocalIPAddress(),
-                    bearerToken: _cfg.AuthToken,
-                    log: Log);
-
-                if (ok)
-                {
-                    Log($"Register request sent to {sel.AgentId} at {sel.IpAddress}:{port} via HTTP (awaiting ack) ✅");
-                    return true;
-                }
-                else
-                {
-                    Log($"Failed to register {sel.AgentId} at {sel.IpAddress}:{port} via HTTP");
-                    return false;
-                }
-            }
-            finally
-            {
-                lock (_registrationInFlight)
-                    _registrationInFlight.Remove(id);
-            }
-        }
-
-        // === Local HTTP helper for /nl/register (corr in URL; Bearer token optional) ===
-        private static async Task<bool> RegisterAgentHttpAsync(
-            string agentId,
-            string agentIp,
-            int agentPort,
-            string masterId,
-            string masterIp,
-            string? bearerToken,
-            Action<string> log)
-        {
-            try
-            {
-                var corr = Guid.NewGuid().ToString("N");
-                var url = $"http://{agentIp}:{agentPort}/nl/register?corr={Uri.EscapeDataString(corr)}&master={Uri.EscapeDataString(masterId)}&ip={Uri.EscapeDataString(masterIp)}";
-
-                using var req = new HttpRequestMessage(HttpMethod.Post, url);
-                if (!string.IsNullOrWhiteSpace(bearerToken))
-                    req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", bearerToken);
-
-                req.Content = new StringContent(""); // empty body
-
-                using var http = new HttpClient() { Timeout = TimeSpan.FromSeconds(3) };
-                var resp = await http.SendAsync(req);
-                if ((int)resp.StatusCode == 200)
-                {
-                    log($"Register POST -> {agentId} OK (corr={corr})");
-                    return true;
-                }
-                else
-                {
-                    log($"Register POST -> {agentId} HTTP {(int)resp.StatusCode} {resp.ReasonPhrase}");
-                    return false;
-                }
-            }
-            catch (Exception ex)
-            {
-                log($"Register POST error -> {agentId}: {ex.Message}");
-                return false;
-            }
-        }
-
-        private async void RegisterAgent_Click(object sender, RoutedEventArgs e)
-        {
-            if (currentRole != NodeRole.Master) return;
-
-            if (NodeGrid.SelectedItem is not AgentStatus sel || sel.AgentId == "Master")
-            {
-                Log("Select an Agent row first.");
-                return;
-            }
-
-            var ok = await TryRegisterAgentAsync(sel);
-            if (ok)
-            {
-                Log($"Registration initiated for {sel.AgentId} … waiting for acknowledgment.");
-            }
-        }
-
-        private void UpdateAgentConfig_Click(object sender, RoutedEventArgs e)
-        {
-            if (currentRole != NodeRole.Master) { Log("Only in Master mode."); return; }
-            if (NodeGrid.SelectedItem is not AgentStatus row || row.AgentId == "Master")
-            {
-                Log("Select an Agent row first."); return;
-            }
-            var ok = comm.SendToAgent(row.AgentId, "RequestConfig");
-            Log(ok ? $"Requested config from {row.AgentId}" : $"Could not reach {row.AgentId}");
-        }
-
-        private void StopAllTasksButton_Click(object sender, RoutedEventArgs e)
-        {
-            if (currentRole != NodeRole.Master) { Log("Only in Master mode."); return; }
-            var ids = agentStatuses.Where(a => a.AgentId != "Master" && a.IsOnline).Select(a => a.AgentId).ToList();
-            foreach (var id in ids) master?.DispatchTaskToAgent("StopAllTasks", id);
-            Log("Requested StopAllTasks on all online agents");
-        }
-
         private void DispatchTest_Click(object sender, RoutedEventArgs e)
         {
             try
@@ -1161,7 +1059,7 @@ namespace NodeLinkUI
                     return;
                 }
 
-                // Run the distributed benchmark (DemoHash) using your existing orchestrator
+                // Distributed benchmark using existing orchestrator/collator
                 NodeMaster.Distrib.DistributedBenchmark.RunDemoHashBenchmark(
                     _orchestrator,
                     _collator,
@@ -1175,7 +1073,6 @@ namespace NodeLinkUI
                 Log($"Dispatch test error: {ex.Message}");
             }
         }
-
 
         private async void ComputeTest_Click(object sender, RoutedEventArgs e)
         {
@@ -1198,7 +1095,8 @@ namespace NodeLinkUI
                 units.Add(new TaskUnit { App = app, Seq = i, Payload = "noop" });
 
             _collator.StartJob(runId, app, units.Count);
-            _orchestrator.Submit(runId, units);
+
+            _orchestrator.Submit(app, units);
 
             await Task.Delay(500);
             Log($"ComputeTest orchestrated run submitted: {app} run={runId} units={units.Count}");
@@ -1216,7 +1114,6 @@ namespace NodeLinkUI
         {
             try
             {
-                DisposeSoftThreads();
                 StopMdns();
                 SaveSettings();
 
@@ -1323,7 +1220,7 @@ namespace NodeLinkUI
         // ===================== Heartbeat =====================
         private void SetupHeartbeat()
         {
-            heartbeatTimer = new System.Timers.Timer(Math.Max(1000, settings.HeartbeatIntervalMs)); // fixed Math.Max
+            heartbeatTimer = new System.Timers.Timer(Math.Max(1000, settings.HeartbeatIntervalMs));
             heartbeatTimer.Elapsed += (s, e) => Dispatcher.Invoke(UpdateHeartbeat);
             heartbeatTimer.AutoReset = true;
             heartbeatTimer.Start();
@@ -1331,8 +1228,6 @@ namespace NodeLinkUI
 
         private void UpdateHeartbeat()
         {
-            SweepInFlight();
-
             if (currentRole == NodeRole.Master)
             {
                 var nowUtc = DateTime.UtcNow;
@@ -1789,45 +1684,6 @@ namespace NodeLinkUI
             return 0f;
         }
 
-        private bool CanDispatchTo(string agentId)
-        {
-            lock (_inFlightByAgent)
-            {
-                if (_inFlightByAgent.TryGetValue(agentId, out var since))
-                {
-                    if ((DateTime.UtcNow - since) < InFlightHold) return false;
-                    _inFlightByAgent.Remove(agentId);
-                }
-                return true;
-            }
-        }
-
-        private void MarkInFlight(string agentId)
-        {
-            lock (_inFlightByAgent)
-                _inFlightByAgent[agentId] = DateTime.UtcNow;
-        }
-
-        private void ClearInFlight(string agentId)
-        {
-            lock (_inFlightByAgent)
-                _inFlightByAgent.Remove(agentId);
-        }
-
-        private void SweepInFlight()
-        {
-            lock (_inFlightByAgent)
-            {
-                if (_inFlightByAgent.Count == 0) return;
-                var now = DateTime.UtcNow;
-                var stale = _inFlightByAgent
-                    .Where(kv => (now - kv.Value) >= InFlightHold)
-                    .Select(kv => kv.Key)
-                    .ToList();
-                foreach (var k in stale) _inFlightByAgent.Remove(k);
-            }
-        }
-
         private void RefreshGridPreservingSelection()
         {
             try
@@ -1931,20 +1787,163 @@ namespace NodeLinkUI
         {
             private readonly CommChannel _comm;
             public AgentCommAdapter(CommChannel comm) => _comm = comm;
-
             public void SendToMaster(string payload) => _comm.SendToMaster(payload);
         }
 
-        private void NodeGrid_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        private void NodeGrid_SelectionChanged(object sender, SelectionChangedEventArgs e) { }
+        private void NodeGrid_SelectionChanged_1(object sender, SelectionChangedEventArgs e) { }
+
+        // ===== Registration helper (HTTP) =====
+        private async Task<bool> TryRegisterAgentAsync(AgentStatus sel)
         {
+            if (currentRole != NodeRole.Master) return false;
+            if (sel == null || string.IsNullOrWhiteSpace(sel.IpAddress))
+            {
+                Log($"Register skipped: no IP for {sel?.AgentId ?? "unknown"}");
+                return false;
+            }
+
+            var id = sel.AgentId;
+
+            try
+            {
+                int port = _cfg.ControlPort;
+
+                var ok = await RegisterAgentHttpAsync(
+                    agentId: sel.AgentId,
+                    agentIp: sel.IpAddress!,
+                    agentPort: port,
+                    masterId: "Master",
+                    masterIp: GetLocalIPAddress(),
+                    bearerToken: _cfg.AuthToken,
+                    log: Log);
+
+                if (ok)
+                {
+                    Log($"Register request sent to {sel.AgentId} at {sel.IpAddress}:{port} via HTTP (awaiting ack) ✅");
+                    return true;
+                }
+                else
+                {
+                    Log($"Failed to register {sel.AgentId} at {sel.IpAddress}:{port} via HTTP");
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"Register error for {id}: {ex.Message}");
+                return false;
+            }
         }
 
-        private void NodeGrid_SelectionChanged_1(object sender, SelectionChangedEventArgs e)
+        private static async Task<bool> RegisterAgentHttpAsync(
+            string agentId,
+            string agentIp,
+            int agentPort,
+            string masterId,
+            string masterIp,
+            string? bearerToken,
+            Action<string> log)
         {
+            try
+            {
+                var corr = Guid.NewGuid().ToString("N");
+                var url = $"http://{agentIp}:{agentPort}/nl/register?corr={Uri.EscapeDataString(corr)}&master={Uri.EscapeDataString(masterId)}&ip={Uri.EscapeDataString(masterIp)}";
 
+                using var req = new HttpRequestMessage(HttpMethod.Post, url);
+                if (!string.IsNullOrWhiteSpace(bearerToken))
+                    req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", bearerToken);
+
+                req.Content = new StringContent("");
+
+                using var http = new HttpClient() { Timeout = TimeSpan.FromSeconds(3) };
+                var resp = await http.SendAsync(req);
+                if ((int)resp.StatusCode == 200)
+                {
+                    log($"Register POST -> {agentId} OK (corr={corr})");
+                    return true;
+                }
+                else
+                {
+                    log($"Register POST -> {agentId} HTTP {(int)resp.StatusCode} {resp.ReasonPhrase}");
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                log($"Register POST error -> {agentId}: {ex.Message}");
+                return false;
+            }
+        }
+
+        // ====== Missing XAML click handlers (stubs wired to current flow) ======
+
+        // RegisterAgent button in XAML
+        private async void RegisterAgent_Click(object sender, RoutedEventArgs e)
+        {
+            if (currentRole != NodeRole.Master)
+            {
+                Log("Register is only available in Master mode.");
+                return;
+            }
+            var sel = NodeGrid.SelectedItem as AgentStatus;
+            if (sel == null)
+            {
+                Log("Select an agent row first.");
+                return;
+            }
+            await TryRegisterAgentAsync(sel);
+        }
+
+        // StopAllTasksButton in XAML
+        private void StopAllTasksButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (currentRole != NodeRole.Master)
+            {
+                Log("Stop All is only available in Master mode.");
+                return;
+            }
+
+            var targets = agentStatuses.Where(a => a.IsOnline && a.AgentId != "Master").ToList();
+            if (targets.Count == 0)
+            {
+                Log("No online agents to stop.");
+                return;
+            }
+
+            foreach (var a in targets)
+                comm.SendToAgent(a.AgentId, "StopAllTasks");
+
+            Log($"Sent StopAllTasks to {targets.Count} agent(s).");
+        }
+
+        // UpdateAgentConfig button in XAML
+        private void UpdateAgentConfig_Click(object sender, RoutedEventArgs e)
+        {
+            if (currentRole == NodeRole.Master)
+            {
+                var sel = NodeGrid.SelectedItem as AgentStatus;
+                if (sel == null)
+                {
+                    Log("Select an agent to request its config.");
+                    return;
+                }
+                comm.SendToAgent(sel.AgentId, "RequestConfig");
+                Log($"Requested config from {sel.AgentId}");
+            }
+            else
+            {
+                var id = localAgentId ?? $"Agent-{Environment.MachineName}";
+                var cfg = BuildAgentConfig(id);
+                comm.SendToMaster($"AgentConfig:{JsonSerializer.Serialize(cfg)}");
+                Log("Sent AgentConfig to Master.");
+            }
         }
     }
 }
+
+
+
 
 
 

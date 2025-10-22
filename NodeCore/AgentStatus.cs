@@ -107,8 +107,8 @@ namespace NodeCore
         public TimeSpan LastTaskDuration { get => _lastTaskDuration; set => Set(ref _lastTaskDuration, value); }
 
         // UI-only aggregation (bound in XAML)
-        private int _softThreadsQueued;
-        public int SoftThreadsQueued { get => _softThreadsQueued; set => Set(ref _softThreadsQueued, value); }
+        //private int _softThreadsQueued;
+        //public int SoftThreadsQueued { get => _softThreadsQueued; set => Set(ref _softThreadsQueued, value); }
 
         // Latency tracking
         private double _lastLatencyMs;

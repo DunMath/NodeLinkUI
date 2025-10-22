@@ -29,5 +29,9 @@
 		<ProjectReference Include="..\NodeCore\NodeCore.csproj" />
 	</ItemGroup>
 
+	<ItemGroup>
+	  <Folder Include="Bootstrap\" />
+	</ItemGroup>
+
 </Project>
 

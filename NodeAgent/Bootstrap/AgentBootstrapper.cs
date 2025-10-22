@@ -33,7 +33,9 @@ namespace NodeAgent
     ///   GET  /tasks/next              -> debug: peek the next queued task (non-destructive)
     ///   POST /task/result             -> optional manual result reporting { taskId, status, detail }
     ///
-    /// A lightweight background executor dequeues items from /compute and completes them.
+    /// App-Run path (primary):
+    ///   CommChannel can short-circuit "AppRun:" lines to OnWireMessage(...) via AppRunSink.
+    ///   We adapt that header to our existing in-process executor queue (no extra threads).
     /// </summary>
     public sealed class AgentBootstrapper
     {
@@ -47,7 +49,7 @@ namespace NodeAgent
         private Task _acceptLoop;
         private volatile bool _isListening;
 
-        // --- simple in-process task queue + executor ---
+        // --- simple in-process task queue + executor (already used by /compute) ---
         private readonly ConcurrentQueue<(string TaskId, string Payload, DateTime EnqueuedUtc)> _tasks
             = new ConcurrentQueue<(string, string, DateTime)>();
 
@@ -64,6 +66,7 @@ namespace NodeAgent
 
         /// <summary>
         /// Start socket listener and advertise ourselves to master (config + pulse).
+        /// Also starts the single executor loop (used by both /compute and AppRun fast path).
         /// </summary>
         public void Start(string masterIp)
         {
@@ -85,11 +88,11 @@ namespace NodeAgent
             // Always advertise ourselves so the grid lights up (even if HTTP failed).
             SendInitialConfigAndPulse();
 
-            // background executor for /compute tasks
+            // Start (or keep) the single executor that drains _tasks
             _execLoop = Task.Run(() => ExecLoopAsync());
         }
 
-        /// <summary>Stop the listener gracefully.</summary>
+        /// <summary>Stop the listener and workers gracefully.</summary>
         public async Task StopAsync()
         {
             FileLogger.Info("AgentBootstrapper.StopAsync()");
@@ -106,6 +109,7 @@ namespace NodeAgent
                 var waits = new List<Task>();
                 if (_acceptLoop != null) waits.Add(_acceptLoop);
                 if (_execLoop != null) waits.Add(_execLoop);
+
                 if (waits.Count > 0)
                     await Task.WhenAny(Task.WhenAll(waits), Task.Delay(1000)).ConfigureAwait(false);
             }
@@ -118,8 +122,9 @@ namespace NodeAgent
                 _tcp = null;
                 _acceptLoop = null;
                 _execLoop = null;
-                _cts?.Dispose();
-                _cts = null;
+
+                _cts?.Dispose(); _cts = null;
+
                 _isListening = false;
                 FileLogger.Info("AgentBootstrapper stopped.");
             }
@@ -323,7 +328,7 @@ namespace NodeAgent
                             WhenUtc = DateTime.UtcNow
                         }).ConfigureAwait(false);
                     }
-                    // ----- compute endpoints -----
+                    // ----- compute endpoints (test harness) -----
                     else if (string.Equals(method, "POST", StringComparison.OrdinalIgnoreCase) && path == "/compute")
                     {
                         // Body is the payload to "compute" (shape: App|Seq|args...)
@@ -387,23 +392,61 @@ namespace NodeAgent
             }
         }
 
-        // --- tiny executor simulating compute (now with real handlers) ---
+        // ===== App-Run path: public entry for CommChannel fast-path =====
+        // Keep this TINY and non-blocking. It simply converts AppRun header into our local queue item.
+        public void OnWireMessage(string line)
+        {
+            if (string.IsNullOrWhiteSpace(line)) return;
+            if (!line.StartsWith("AppRun:", StringComparison.OrdinalIgnoreCase)) return;
+
+            // Strip "AppRun:" ; keep only the header (drop any base64 body after newline for now)
+            int colon = line.IndexOf(':');
+            string header = (colon >= 0) ? line.Substring(colon + 1) : line;
+
+            int nl = header.IndexOf('\n');
+            if (nl >= 0) header = header.Substring(0, nl);
+
+            // Typical header shapes:
+            // A) AppId|CorrId|i/n|AgentId
+            // B) AppId|i|n|CorrId
+            // C) AppId|Seq|...
+            // We adapt to "App|Seq|args..." which ProcessComputePayload already understands.
+            var parts = header.Split('|');
+            string app = parts.Length > 0 ? parts[0] : "App";
+            int seq = 0;
+
+            // Try parse i/n in the 3rd token (A)
+            if (parts.Length >= 3 && parts[2].Contains('/'))
+            {
+                var pair = parts[2].Split('/');
+                int.TryParse(pair[0], out seq);
+            }
+            // Try parse i in the 2nd token (B/C)
+            else if (parts.Length >= 2)
+            {
+                int.TryParse(parts[1], out seq);
+            }
+
+            string computePayload = $"{app}|{seq}";
+            var taskId = Guid.NewGuid().ToString("N");
+            _tasks.Enqueue((taskId, computePayload, DateTime.UtcNow));
+            _taskSignal.Release();
+        }
+
+        // ===== single executor used by both /compute and AppRun =====
         private async Task ExecLoopAsync()
         {
             FileLogger.Info("ExecLoop started");
-            while (_cts != null && !_cts.IsCancellationRequested)
+            while (_cts == null || !_cts.IsCancellationRequested)
             {
                 try
                 {
-                    // Wait for a task or cancellation
                     await _taskSignal.WaitAsync(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
                     if (_cts != null && _cts.IsCancellationRequested) break;
 
-                    (string TaskId, string Payload, DateTime EnqueuedUtc) item;
-                    while (_tasks.TryDequeue(out item))
+                    while (_tasks.TryDequeue(out var item))
                     {
                         FileLogger.Info($"Executing task {item.TaskId} payload=\"{item.Payload}\"");
-                        // Process workload based on payload (App|Seq|args...)
                         ProcessComputePayload(item.Payload);
                     }
                 }
@@ -457,7 +500,7 @@ namespace NodeAgent
                     return;
                 }
 
-                // Legacy fallback: echo payload as the "job id"
+                // Default fallback: echo payload as the "job id"
                 _comm.SendToMaster($"ComputeResult:{payload}:OK");
             }
             catch (Exception ex)
@@ -508,7 +551,7 @@ namespace NodeAgent
             }
         }
 
-        // --- HTTP response helpers (keep simple, C# 12 safe) ---
+        // --- HTTP response helpers (keep simple) ---
 
         private static async Task WriteTextAsync(StreamWriter writer, int status, string text)
         {

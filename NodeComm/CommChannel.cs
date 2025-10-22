@@ -13,6 +13,13 @@ namespace NodeComm
     {
         public event Action<string, string>? OnMessageReceived;
 
+        /// <summary>
+        /// Agent-only fast path: if set and we're running as Agent, any inbound line that
+        /// starts with "AppRun:" will be routed to this sink and will NOT flow through
+        /// OnMessageReceived. Wire this to AgentBootstrapper.OnWireMessage.
+        /// </summary>
+        public Action<string>? AppRunSink { get; set; }
+
         // Config
         private const int DefaultPort = 5000;
         private readonly int _port;
@@ -95,6 +102,13 @@ namespace NodeComm
                         continue;
                     }
 
+                    // Fast-path for AppRun on AGENT: route directly to the executor sink
+                    if (_isAgent && msg.StartsWith("AppRun:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try { AppRunSink?.Invoke(msg); } catch { /* keep comms alive */ }
+                        continue; // skip generic OnMessageReceived
+                    }
+
                     // Decide "agentId" for the event we raise:
                     //  - If we're an agent: any incoming msg is for _localAgentId
                     //  - If we're master: try to guess agent id from message or endpoint map
@@ -133,7 +147,7 @@ namespace NodeComm
 
             // Try parse by well-known message shapes (cheap string ops)
 
-            // RegisterAck:{agentId}:{json}
+            // RegisterAck:{agentId}:{...}
             if (message.StartsWith("RegisterAck:", StringComparison.OrdinalIgnoreCase))
             {
                 var first = message.IndexOf(':');
@@ -145,7 +159,7 @@ namespace NodeComm
                 }
             }
 
-            // RegisterHello:{agentId}:{json}
+            // RegisterHello:{agentId}:{...}
             if (message.StartsWith("RegisterHello:", StringComparison.OrdinalIgnoreCase))
             {
                 var first = message.IndexOf(':');
@@ -178,7 +192,7 @@ namespace NodeComm
                 if (!string.IsNullOrWhiteSpace(id)) return id;
             }
 
-            // AgentStatus:{json}  (legacy)  -> find "AgentId":"..."
+            // AgentStatus:{json} (legacy) -> find "AgentId":"..."
             if (message.StartsWith("AgentStatus:", StringComparison.OrdinalIgnoreCase))
             {
                 var id = ExtractAgentIdFromJsonTail(message, "AgentStatus:");
@@ -294,6 +308,7 @@ namespace NodeComm
             }
             catch { return false; }
         }
+
         // Broadcast a Ping that carries the Master's identity so Agents can unicast back.
         public bool BroadcastPing(string masterId, string masterIp, int sequence)
         {
@@ -309,6 +324,7 @@ namespace NodeComm
             }
             catch { return false; }
         }
+
         // Convenience: WhoIsAlive broadcast
         public bool BroadcastWhoIsAlive() => Broadcast("WhoIsAlive");
 
@@ -325,6 +341,7 @@ namespace NodeComm
                 try { handler(message); } catch { /* keep comms alive */ }
             };
         }
+
         // Unicast nudge to a known agent endpoint (fallback when broadcast is flaky).
         public bool SendWhoIsAlive(string agentId)
         {
@@ -339,6 +356,7 @@ namespace NodeComm
             }
             catch { return false; }
         }
+
         /// <summary>
         /// Older code calls Register(agentId, handler) to receive messages for a specific agent.
         /// We filter OnMessageReceived by agentId and forward only those messages.
@@ -373,6 +391,8 @@ namespace NodeComm
         }
     }
 }
+
+
 
 
 
